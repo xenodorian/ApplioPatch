@@ -1,4 +1,4 @@
-From 6e4644e0d4b000da827688f68d769daa83542ffd Mon Sep 17 00:00:00 2001
+From 6bebf7e95cf3a993678fe1042431527fcd240637 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 1 Nov 2026 07:53:18 -0600
 Subject: [PATCH] Add optional vocal restoration (VoiceFixer, Resemble Enhance)
@@ -8,6 +8,10 @@ Subject: [PATCH] Add optional vocal restoration (VoiceFixer, Resemble Enhance)
   environment so their dependencies cannot conflict with Applio's stack.
   Transitive versions are frozen to a date, results are cached on disk, and
   Resemble Enhance installs without its unused training dependencies.
+- The worker makes the published Resemble Enhance model files load on current
+  PyTorch, NumPy and Windows: NumPy stays below 2.4, hparams.yaml path tags
+  are rewritten as plain strings, and unrestricted checkpoint loading is
+  limited to the sidecar's own model folders.
 - Restoration runs at the file's native sample rate before resampling.
 - New --restore-mode, --restore-nfe/solver/lambd/tau and --f0-smooth CLI
   options, plus a Vocal restoration panel in the single-file tab.
@@ -19,11 +23,11 @@ Claude-Session: https://claude.ai/code/session_015KE1esskP9ysQXNHcQWpEW
  core.py                               |  89 +++++++++
  rvc/infer/infer.py                    |   1 +
  rvc/infer/pipeline.py                 |  28 +++
- rvc/lib/tools/audio_restore.py        | 267 ++++++++++++++++++++++++++
- rvc/lib/tools/audio_restore_worker.py | 111 +++++++++++
+ rvc/lib/tools/audio_restore.py        | 269 ++++++++++++++++++++++++++
+ rvc/lib/tools/audio_restore_worker.py | 178 +++++++++++++++++
  rvc/lib/utils.py                      |  15 ++
  tabs/inference/inference.py           |  33 +++-
- 7 files changed, 543 insertions(+), 1 deletion(-)
+ 7 files changed, 612 insertions(+), 1 deletion(-)
  create mode 100644 rvc/lib/tools/audio_restore.py
  create mode 100644 rvc/lib/tools/audio_restore_worker.py
 
@@ -271,10 +275,10 @@ index 94b341a..6c84fa9 100644
              pitchf = pitchf[:p_len]
 diff --git a/rvc/lib/tools/audio_restore.py b/rvc/lib/tools/audio_restore.py
 new file mode 100644
-index 0000000..fd96549
+index 0000000..86b617b
 --- /dev/null
 +++ b/rvc/lib/tools/audio_restore.py
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,269 @@
 +"""Optional vocal restoration before conversion (VoiceFixer, Resemble Enhance).
 +
 +Both restorers depend on packages that conflict with Applio's pinned stack
@@ -306,7 +310,9 @@ index 0000000..fd96549
 +WORKER = Path(__file__).with_name("audio_restore_worker.py")
 +TIMEOUT_SECONDS = 60 * 60
 +
-+# Exact pins taken from a working resolve on Python 3.11. Transitive
++# Exact pins taken from a working resolve on Python 3.11. NumPy stays below
++# 2.4 because Resemble Enhance converts one-element arrays with float(), which
++# NumPy 2.4 rejects. Transitive
 +# dependencies are frozen to a date with uv's --exclude-newer so a fresh
 +# install months later resolves to the same versions.
 +RESOLVE_DATE = "2026-11-01"
@@ -318,7 +324,7 @@ index 0000000..fd96549
 +        "packages": [
 +            "voicefixer==0.1.3",
 +            "torch==2.15.0",
-+            "numpy==2.4.6",
++            "numpy==2.3.5",
 +            "scipy==1.17.1",
 +            "librosa==0.11.0",
 +            "soundfile==0.14.0",
@@ -334,7 +340,7 @@ index 0000000..fd96549
 +        "packages": [
 +            "torch==2.15.0",
 +            "torchaudio==2.11.1",
-+            "numpy==2.4.6",
++            "numpy==2.3.5",
 +            "librosa==0.11.0",
 +            "soundfile==0.14.0",
 +            "omegaconf==2.4.0",
@@ -544,10 +550,10 @@ index 0000000..fd96549
 +    return restored
 diff --git a/rvc/lib/tools/audio_restore_worker.py b/rvc/lib/tools/audio_restore_worker.py
 new file mode 100644
-index 0000000..f16675a
+index 0000000..bf96108
 --- /dev/null
 +++ b/rvc/lib/tools/audio_restore_worker.py
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,178 @@
 +"""Sidecar entry point for audio restoration.
 +
 +Runs inside the isolated restoration environment, never inside Applio's own
@@ -562,6 +568,9 @@ index 0000000..f16675a
 +
 +import argparse
 +import importlib.util
++import os
++import pathlib
++import re
 +import sys
 +import types
 +
@@ -596,7 +605,65 @@ index 0000000..f16675a
 +    runtime.engine, runtime.utils = engine, utils
 +
 +
++_PATH_TAG = re.compile(
++    r"!!python/object/apply:pathlib\.PosixPath\r?\n((?:- [^\r\n]*\r?\n?)+)"
++)
++
++
++def _normalize_hparams(path):
++    """Rewrite pathlib tags in Resemble Enhance's hparams.yaml as plain strings.
++
++    The published file stores paths as pathlib.PosixPath objects, which Python
++    refuses to create on Windows. The three paths are training-data folders
++    that inference never reads, so plain strings carry everything needed.
++    """
++    path = pathlib.Path(path)
++    text = path.read_text(encoding="utf-8")
++
++    def plain(match):
++        parts = [line[2:].strip() for line in match.group(1).splitlines()]
++        return "/".join(parts) + "\n"
++
++    fixed = _PATH_TAG.sub(plain, text)
++    if fixed != text:
++        path.write_text(fixed, encoding="utf-8")
++    return fixed != text
++
++
++def _checkpoint_roots():
++    roots = [pathlib.Path(os.path.expanduser("~")) / ".cache" / "voicefixer"]
++    spec = importlib.util.find_spec("resemble_enhance")
++    if spec and spec.origin:
++        roots.append(pathlib.Path(spec.origin).parent / "model_repo")
++    return [root.resolve() for root in roots]
++
++
++def _trust_own_checkpoints(roots=None):
++    """Allow full unpickling only for checkpoints the packages downloaded.
++
++    Recent PyTorch defaults torch.load to a restricted unpickler, and both
++    restorers call it without arguments on DeepSpeed or Lightning checkpoints
++    that may hold non-tensor objects. Files inside the sidecar's own model
++    folders are loaded unrestricted; every other path keeps the safe default.
++    """
++    import torch
++
++    allowed = _checkpoint_roots() if roots is None else [pathlib.Path(r).resolve() for r in roots]
++    original = torch.load
++
++    def load(f, *args, **kwargs):
++        if kwargs.get("weights_only") is None and isinstance(f, (str, os.PathLike)):
++            path = pathlib.Path(f).resolve()
++            if any(root in path.parents for root in allowed):
++                kwargs["weights_only"] = False
++        return original(f, *args, **kwargs)
++
++    torch.load = load
++    return original
++
++
 +def run_voicefixer(args):
++    _trust_own_checkpoints()
 +    from voicefixer import VoiceFixer
 +
 +    # mode 0 is the default general-purpose restoration path.
@@ -615,7 +682,13 @@ index 0000000..f16675a
 +    import torch
 +
 +    _stand_in_for_deepspeed()
++    _trust_own_checkpoints()
++    from resemble_enhance.enhancer.download import download
 +    from resemble_enhance.enhancer.inference import enhance
++
++    # Fetch the model files first so hparams.yaml can be made Windows-safe
++    # before the package parses it.
++    _normalize_hparams(download() / "hparams.yaml")
 +
 +    # soundfile instead of torchaudio.load/save: recent torchaudio builds
 +    # route file I/O through TorchCodec, which is not pinned here.

@@ -47,32 +47,43 @@ Restorer weights are downloaded by the packages on first run (VoiceFixer from Ze
 
 ## What was verified
 
-Run in the authoring environment (Linux, CPU, Python 3.11):
+Run in the authoring environment (Linux, CPU, Python 3.11), against the real published Resemble Enhance configuration and random-weight stand-ins for both restorers' checkpoints:
 
-- The patch applies to base commit `59c1131` on a fresh checkout and every modified file compiles.
+- The patch applies to base commit `59c1131` on a clean checkout and every modified file compiles.
 - `infer --help` lists the new options. `off` is an exact bypass and invalid modes are rejected.
 - `--f0-smooth` filters each voiced run on its own. Voicing is unchanged, spikes inside a run are removed, and dtype, empty and all-unvoiced input are handled.
 - The restoration cache hits on identical input, misses when audio or tuning changes, prunes to a fixed size, and recomputes corrupt or wrong-length entries.
-- Resemble Enhance's real inference code runs end to end in the sidecar environment, with no `deepspeed`, `gradio` or `ptflops` installed. This used default hyperparameters and random weights, because the real weights were not downloadable there.
+- Applio's audio loader, the sidecar subprocess, the worker, checkpoint loading, restoration, resampling back to the input rate, and the cache all run end to end for both VoiceFixer and Resemble Enhance.
+- Resemble Enhance runs with the real published `hparams.yaml` for the midpoint, rk4 and euler solvers and the extreme tuning values.
 
-## What was not verified
+Problems this testing found and fixed:
 
-- Output quality. No real restorer weights were run, and no real garbled vocal was converted. Whether restoration actually improves your conversions is untested.
-- VoiceFixer beyond installation. Importing it downloads its weights, which the authoring sandbox blocked.
-- Windows and macOS. The pins were resolved on Linux. The `deepspeed` stand-in exists so Resemble Enhance can install on Windows, but that has not been run there.
-- GPU execution.
+- NumPy 2.4 crashes Resemble Enhance. It converts a one-element array with `float()`, which NumPy 2.4 rejects, and this only appears with the real hyperparameters. Both sidecars pin NumPy 2.3.5.
+- The published `hparams.yaml` stores paths as `pathlib.PosixPath`, which Python cannot create on Windows (reproduced in simulation). The worker rewrites those entries as plain strings.
+- Current PyTorch restricts what `torch.load` may unpickle, and DeepSpeed-style checkpoints can contain other objects (reproduced with a stand-in). The worker allows unrestricted loading only for files inside the sidecar's own model folders. Every other path keeps the safe default.
+- Resemble Enhance needs `tabulate` at model construction.
+
+## What could not be verified
+
+- Output quality. The real model weights could not be downloaded in the authoring sandbox (Hugging Face and Zenodo are blocked), so no real vocal has been restored. Whether restoration improves your conversions is untested.
+- The real checkpoints' contents. Loading was tested with stand-ins, and the loading policy is designed to work whether or not they hold non-tensor objects.
+- Windows and macOS. The Windows config problem was reproduced and fixed in simulation only. Pins were resolved on Linux.
+- GPU execution. No GPU was available. On Windows, PyPI installs a CPU-only PyTorch, so the sidecars may run on the CPU there and be slow.
 
 ## Known limitations
 
-- Each sidecar environment is large, about 6 GB measured on Linux, because of PyTorch and its CUDA libraries. Dropping `deepspeed` and `gradio` did not shrink it meaningfully; the benefit is that Resemble Enhance installs without them. Using both restorers costs roughly 12 GB.
+- Each sidecar environment is large, about 6 GB measured on Linux, because of PyTorch and its CUDA libraries. Using both restorers costs roughly 12 GB.
 - Restorer weights are stored inside the sidecar environment. Deleting `audio-restore/` under the Applio config directory removes them.
+- The checkpoints are trusted: they come from the official Resemble AI Hugging Face repo and the VoiceFixer Zenodo record, and are not hash-pinned.
 - Batch tab and preset files have no restoration controls yet. Use the CLI for batch work.
 - Each file launches the sidecar and reloads the model. Identical repeat runs are served from an on-disk cache of the last 24 results.
 - Restoration changes the input signal. Compare the output with the original before converting at scale.
 
 ## Ideas for next steps
 
-- CPU-only PyTorch wheels for the sidecar on machines without a GPU.
+- Run a real restoration once the weights are reachable, and tune `--restore-lambd`, `--restore-tau` and `--f0-smooth` on actual Suno output.
+- Hash-pin the two checkpoints.
+- CUDA PyTorch wheels for the sidecars on Windows.
 - Detect damaged frames and restore only those, blending the original elsewhere.
 - Batch tab controls and preset support.
 - Fine-tune voice models on augmented, degraded copies of the training set.
