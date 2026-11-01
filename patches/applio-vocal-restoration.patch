@@ -1,0 +1,748 @@
+From 6e4644e0d4b000da827688f68d769daa83542ffd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 07:53:18 -0600
+Subject: [PATCH] Add optional vocal restoration (VoiceFixer, Resemble Enhance)
+ and pitch smoothing
+
+- audio_restore.py runs each restorer in an isolated, version-pinned sidecar
+  environment so their dependencies cannot conflict with Applio's stack.
+  Transitive versions are frozen to a date, results are cached on disk, and
+  Resemble Enhance installs without its unused training dependencies.
+- Restoration runs at the file's native sample rate before resampling.
+- New --restore-mode, --restore-nfe/solver/lambd/tau and --f0-smooth CLI
+  options, plus a Vocal restoration panel in the single-file tab.
+- f0 median smoothing runs inside each voiced run so voicing is unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015KE1esskP9ysQXNHcQWpEW
+---
+ core.py                               |  89 +++++++++
+ rvc/infer/infer.py                    |   1 +
+ rvc/infer/pipeline.py                 |  28 +++
+ rvc/lib/tools/audio_restore.py        | 267 ++++++++++++++++++++++++++
+ rvc/lib/tools/audio_restore_worker.py | 111 +++++++++++
+ rvc/lib/utils.py                      |  15 ++
+ tabs/inference/inference.py           |  33 +++-
+ 7 files changed, 543 insertions(+), 1 deletion(-)
+ create mode 100644 rvc/lib/tools/audio_restore.py
+ create mode 100644 rvc/lib/tools/audio_restore_worker.py
+
+diff --git a/core.py b/core.py
+index 07c58cd..8df8528 100644
+--- a/core.py
++++ b/core.py
+@@ -133,6 +133,12 @@ def _base_infer_kwargs(
+     onnx_precision="auto",
+     cleanup_mode="off",
+     cleanup_strength=12,
++    restore_mode: str = "off",
++    restore_nfe: int = 32,
++    restore_solver: str = "midpoint",
++    restore_lambd: float = 0.5,
++    restore_tau: float = 0.5,
++    f0_smooth: int = 0,
+ ):
+     return {
+         "model_path": pth_path,
+@@ -157,6 +163,12 @@ def _base_infer_kwargs(
+         "onnx_precision": onnx_precision,
+         "cleanup_mode": cleanup_mode,
+         "cleanup_strength": cleanup_strength,
++        "restore_mode": restore_mode,
++        "restore_nfe": restore_nfe,
++        "restore_solver": restore_solver,
++        "restore_lambd": restore_lambd,
++        "restore_tau": restore_tau,
++        "f0_smooth": f0_smooth,
+     }
+ 
+ 
+@@ -185,6 +197,12 @@ def run_infer_script(
+     onnx_precision: str = "auto",
+     cleanup_mode: str = "off",
+     cleanup_strength: float = 12,
++    restore_mode: str = "off",
++    restore_nfe: int = 32,
++    restore_solver: str = "midpoint",
++    restore_lambd: float = 0.5,
++    restore_tau: float = 0.5,
++    f0_smooth: int = 0,
+ ):
+     kwargs = _base_infer_kwargs(
+         pitch=pitch,
+@@ -209,6 +227,12 @@ def run_infer_script(
+         onnx_precision=onnx_precision,
+         cleanup_mode=cleanup_mode,
+         cleanup_strength=cleanup_strength,
++        restore_mode=restore_mode,
++        restore_nfe=restore_nfe,
++        restore_solver=restore_solver,
++        restore_lambd=restore_lambd,
++        restore_tau=restore_tau,
++        f0_smooth=f0_smooth,
+     )
+     kwargs["audio_input_path"] = input_path
+     kwargs["audio_output_path"] = output_path
+@@ -244,6 +268,12 @@ def run_batch_infer_script(
+     onnx_precision: str = "auto",
+     cleanup_mode: str = "off",
+     cleanup_strength: float = 12,
++    restore_mode: str = "off",
++    restore_nfe: int = 32,
++    restore_solver: str = "midpoint",
++    restore_lambd: float = 0.5,
++    restore_tau: float = 0.5,
++    f0_smooth: int = 0,
+ ):
+     kwargs = _base_infer_kwargs(
+         pitch=pitch,
+@@ -268,6 +298,12 @@ def run_batch_infer_script(
+         onnx_precision=onnx_precision,
+         cleanup_mode=cleanup_mode,
+         cleanup_strength=cleanup_strength,
++        restore_mode=restore_mode,
++        restore_nfe=restore_nfe,
++        restore_solver=restore_solver,
++        restore_lambd=restore_lambd,
++        restore_tau=restore_tau,
++        f0_smooth=f0_smooth,
+     )
+     kwargs["audio_input_paths"] = input_folder
+     kwargs["audio_output_path"] = output_folder
+@@ -303,6 +339,12 @@ def run_tts_script(
+     formant_timbre: float = 1.0,
+     cleanup_mode: str = "off",
+     cleanup_strength: float = 12,
++    restore_mode: str = "off",
++    restore_nfe: int = 32,
++    restore_solver: str = "midpoint",
++    restore_lambd: float = 0.5,
++    restore_tau: float = 0.5,
++    f0_smooth: int = 0,
+ ):
+     tts_script_path = os.path.join(
+         current_script_directory, "rvc", "lib", "tools", "tts.py"
+@@ -835,6 +877,51 @@ def _formant_opts(func):
+     return func
+ 
+ 
++def _restore_opts(func):
++    """Vocal restoration and pitch smoothing options for infer and batch_infer."""
++    opts = [
++        click.option(
++            "--restore-mode",
++            type=click.Choice(["off", "voicefixer", "resemble-enhance"]),
++            default="off",
++            help="Restore degraded input before conversion. Each restorer is installed once into its own environment on first use.",
++        ),
++        click.option(
++            "--restore-nfe",
++            type=click.IntRange(1, 128),
++            default=32,
++            help="Resemble Enhance: number of function evaluations. Higher is slower and cleaner.",
++        ),
++        click.option(
++            "--restore-solver",
++            type=click.Choice(["midpoint", "rk4", "euler"]),
++            default="midpoint",
++            help="Resemble Enhance: ODE solver.",
++        ),
++        click.option(
++            "--restore-lambd",
++            type=click.FloatRange(0, 1),
++            default=0.5,
++            help="Resemble Enhance: denoising strength.",
++        ),
++        click.option(
++            "--restore-tau",
++            type=click.FloatRange(0, 1),
++            default=0.5,
++            help="Resemble Enhance: prior temperature. Higher adds more generated detail.",
++        ),
++        click.option(
++            "--f0-smooth",
++            type=click.IntRange(0, 15),
++            default=0,
++            help="Median-filter the pitch contour over this many frames (0 disables). Try 5 for rasp.",
++        ),
++    ]
++    for opt in reversed(opts):
++        func = opt(func)
++    return func
++
++
+ @click.group(invoke_without_command=True)
+ @click.version_option(
+     version=VERSION, prog_name="Applio", message="%(prog)s v%(version)s"
+@@ -859,6 +946,7 @@ def cli(ctx):
+ )
+ @_infer_opts
+ @_formant_opts
++@_restore_opts
+ def infer(**kwargs):
+     """Run voice conversion on a single audio file."""
+     result = run_infer_script(**kwargs)
+@@ -880,6 +968,7 @@ def infer(**kwargs):
+ )
+ @_infer_opts
+ @_formant_opts
++@_restore_opts
+ def batch_infer(**kwargs):
+     """Run voice conversion on multiple audio files in a folder."""
+     result = run_batch_infer_script(**kwargs)
+diff --git a/rvc/infer/infer.py b/rvc/infer/infer.py
+index e041dba..a62742a 100644
+--- a/rvc/infer/infer.py
++++ b/rvc/infer/infer.py
+@@ -242,6 +242,7 @@ class VoiceConverter:
+             f0_autotune_strength=f0_autotune_strength,
+             proposed_pitch=proposed_pitch,
+             proposed_pitch_threshold=proposed_pitch_threshold,
++            f0_smooth=kwargs.get("f0_smooth", 0),
+         )
+ 
+         if (
+diff --git a/rvc/infer/pipeline.py b/rvc/infer/pipeline.py
+index 94b341a..6c84fa9 100644
+--- a/rvc/infer/pipeline.py
++++ b/rvc/infer/pipeline.py
+@@ -30,6 +30,29 @@ bh, ah = signal.butter(
+ )
+ 
+ 
++
++def _smooth_f0(f0, window):
++    """Median-filter the pitch contour inside each voiced run.
++
++    Unvoiced frames (f0 == 0) are never touched and never enter a median, so
++    voiced runs keep their exact length and their edges are not pulled toward
++    zero. The window is in frames, forced odd, and shrinks to fit short runs.
++    """
++    from scipy.ndimage import median_filter
++
++    size = int(window) | 1
++    out = f0.copy()
++    voiced = f0 > 0
++    edges = np.flatnonzero(np.diff(np.concatenate(([0], voiced.view(np.int8), [0]))))
++    for start, end in zip(edges[::2], edges[1::2]):
++        run = end - start
++        if run < 3:
++            continue
++        width = min(size, run if run % 2 else run - 1)
++        out[start:end] = median_filter(f0[start:end], size=width, mode="nearest")
++    return out
++
++
+ class AudioProcessor:
+     """
+     A class for processing audio signals, specifically for adjusting RMS levels.
+@@ -211,6 +234,7 @@ class Pipeline:
+         f0_autotune_strength: float = 1.0,
+         proposed_pitch: bool = False,
+         proposed_pitch_threshold: float = 155.0,
++        f0_smooth: int = 0,
+     ):
+         """
+         Estimates the fundamental frequency (F0) of a given audio signal using various methods.
+@@ -274,6 +298,8 @@ class Pipeline:
+             )
+ 
+         # f0 adjustments
++        if f0_smooth and f0_smooth > 1:
++            f0 = _smooth_f0(f0, f0_smooth)
+         if f0_autotune is True:
+             f0 = self.autotune.autotune_f0(f0, f0_autotune_strength)
+         if proposed_pitch is True:
+@@ -435,6 +461,7 @@ class Pipeline:
+         f0_autotune_strength,
+         proposed_pitch,
+         proposed_pitch_threshold,
++        f0_smooth=0,
+     ):
+         """
+         The main pipeline function for performing voice conversion.
+@@ -498,6 +525,7 @@ class Pipeline:
+                 f0_autotune_strength,
+                 proposed_pitch,
+                 proposed_pitch_threshold,
++                f0_smooth=f0_smooth,
+             )
+             pitch = pitch[:p_len]
+             pitchf = pitchf[:p_len]
+diff --git a/rvc/lib/tools/audio_restore.py b/rvc/lib/tools/audio_restore.py
+new file mode 100644
+index 0000000..fd96549
+--- /dev/null
++++ b/rvc/lib/tools/audio_restore.py
+@@ -0,0 +1,267 @@
++"""Optional vocal restoration before conversion (VoiceFixer, Resemble Enhance).
++
++Both restorers depend on packages that conflict with Applio's pinned stack
++(different numpy/torch/deepspeed requirements), so each one runs in its own
++sidecar virtual environment under the Applio config directory. The sidecar is
++created on first use from exact version pins and reused afterwards. Restoration
++runs only on the local machine; no audio is uploaded.
++
++Model weights are fetched by the packages themselves on first run:
++VoiceFixer from Zenodo, Resemble Enhance from Hugging Face.
++"""
++
++import hashlib
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++
++import numpy as np
++import soundfile as sf
++import soxr
++
++from rvc.lib.user_config import config_path
++
++SIDECAR_VERSION = "1"
++WORKER = Path(__file__).with_name("audio_restore_worker.py")
++TIMEOUT_SECONDS = 60 * 60
++
++# Exact pins taken from a working resolve on Python 3.11. Transitive
++# dependencies are frozen to a date with uv's --exclude-newer so a fresh
++# install months later resolves to the same versions.
++RESOLVE_DATE = "2026-11-01"
++CACHE_LIMIT = 24
++
++SPECS = {
++    "voicefixer": {
++        "python": "3.11",
++        "packages": [
++            "voicefixer==0.1.3",
++            "torch==2.15.0",
++            "numpy==2.4.6",
++            "scipy==1.17.1",
++            "librosa==0.11.0",
++            "soundfile==0.14.0",
++        ],
++        "nodeps": [],
++    },
++    "resemble-enhance": {
++        "python": "3.11",
++        # The package declares deepspeed, gradio and other training or demo
++        # dependencies that inference never uses. It is installed with
++        # --no-deps and only the runtime packages are listed here; the worker
++        # supplies a stand-in for the unused deepspeed import.
++        "packages": [
++            "torch==2.15.0",
++            "torchaudio==2.11.1",
++            "numpy==2.4.6",
++            "librosa==0.11.0",
++            "soundfile==0.14.0",
++            "omegaconf==2.4.0",
++            "scipy",
++            "tqdm",
++            "rich",
++            "resampy",
++            "pandas",
++            "tabulate",
++            "matplotlib",
++        ],
++        "nodeps": [
++            "resemble-enhance @ git+https://github.com/resemble-ai/resemble-enhance.git@8e978149bfe8abab3eb77d965d579a111afdb0ff",
++        ],
++    },
++}
++
++MODES = ("off", "voicefixer", "resemble-enhance")
++
++
++def _root():
++    return config_path().parent / "audio-restore"
++
++
++def _env_dir(backend):
++    return _root() / f"{backend}-v{SIDECAR_VERSION}"
++
++
++def _python(env):
++    if os.name == "nt":
++        return env / "Scripts" / "python.exe"
++    return env / "bin" / "python"
++
++
++def _run(command, env=None):
++    result = subprocess.run(
++        command,
++        capture_output=True,
++        text=True,
++        env=env,
++        timeout=TIMEOUT_SECONDS,
++    )
++    if result.returncode != 0:
++        tail = "\n".join((result.stderr or result.stdout).splitlines()[-15:])
++        raise RuntimeError(f"Audio restoration failed:\n{tail}")
++    return result
++
++
++def ensure_sidecar(backend):
++    """Create or reuse the isolated environment for one restorer."""
++    spec = SPECS[backend]
++    env = _env_dir(backend)
++    python = _python(env)
++    marker = env / "applio-spec.json"
++    wanted = json.dumps(spec, sort_keys=True)
++    if python.exists() and marker.exists() and marker.read_text() == wanted:
++        return python
++
++    env.parent.mkdir(parents=True, exist_ok=True)
++    print(f"Preparing {backend} environment (first use only)...", flush=True)
++    if env.exists():
++        shutil.rmtree(env)
++    uv = shutil.which("uv")
++    if uv:
++        _run([uv, "venv", "--python", spec["python"], str(env)])
++        base = [uv, "pip", "install", "--python", str(python)]
++        _run(base + ["--exclude-newer", RESOLVE_DATE, *spec["packages"]])
++        if spec["nodeps"]:
++            _run(base + ["--no-deps", *spec["nodeps"]])
++    else:
++        _run([sys.executable, "-m", "venv", str(env)])
++        base = [str(python), "-m", "pip", "install"]
++        _run(base + list(spec["packages"]))
++        if spec["nodeps"]:
++            _run(base + ["--no-deps", *spec["nodeps"]])
++    marker.write_text(wanted)
++    return python
++
++
++def _device():
++    try:
++        import torch
++
++        return "cuda" if torch.cuda.is_available() else "cpu"
++    except Exception:
++        return "cpu"
++
++
++def _cache_key(data, sample_rate, mode, options):
++    digest = hashlib.sha256()
++    digest.update(np.ascontiguousarray(data).tobytes())
++    digest.update(
++        json.dumps(
++            [int(sample_rate), mode, SIDECAR_VERSION, SPECS[mode], options],
++            sort_keys=True,
++            default=str,
++        ).encode()
++    )
++    return digest.hexdigest()
++
++
++def _cache_get(path, length):
++    try:
++        cached = np.load(path)
++    except (OSError, ValueError):
++        return None
++    return cached if cached.ndim == 1 and len(cached) == length else None
++
++
++def _cache_put(folder, path, restored):
++    folder.mkdir(parents=True, exist_ok=True)
++    # Write then rename so an interrupted job never leaves a truncated entry.
++    temporary = path.with_suffix(".tmp.npy")
++    np.save(temporary, restored)
++    temporary.replace(path)
++    entries = sorted(folder.glob("*.npy"), key=lambda entry: entry.stat().st_mtime)
++    for stale in entries[:-CACHE_LIMIT]:
++        stale.unlink(missing_ok=True)
++
++
++def restore_audio(audio, sample_rate, mode="off", **options):
++    """Return restored mono float32 audio at the original rate and length.
++
++    Off is an exact bypass. The sidecar receives a 32-bit float WAV and
++    returns one; the result is resampled back to the input rate and trimmed
++    or padded to the input length.
++    """
++    if mode not in MODES:
++        raise ValueError(f"Unknown restoration mode: {mode}")
++    if mode == "off":
++        return audio
++
++    data = np.asarray(audio, dtype=np.float32)
++    if data.ndim > 1:
++        data = data.mean(axis=1)
++    if not np.isfinite(data).all():
++        raise ValueError("Restoration input contains non-finite samples")
++    if not data.size or not data.any():
++        return data
++
++    tuning = {
++        key: options.get(key)
++        for key in ("nfe", "solver", "lambd", "tau")
++        if mode == "resemble-enhance"
++    }
++    cache_folder = _root() / "cache"
++    cache_path = cache_folder / f"{_cache_key(data, sample_rate, mode, tuning)}.npy"
++    cached = _cache_get(cache_path, len(data))
++    if cached is not None:
++        print(f"Audio restoration: {mode} (cached)", flush=True)
++        os.utime(cache_path)
++        return cached
++
++    python = ensure_sidecar(mode)
++    device = options.get("device") or _device()
++    print(f"Audio restoration: {mode} on {device}", flush=True)
++
++    with tempfile.TemporaryDirectory(prefix="applio-restore-") as directory:
++        source = Path(directory) / "input.wav"
++        target = Path(directory) / "output.wav"
++        sf.write(source, data, int(sample_rate), subtype="FLOAT")
++
++        command = [
++            str(python),
++            "-I",
++            str(WORKER),
++            "--backend",
++            mode,
++            "--input",
++            str(source),
++            "--output",
++            str(target),
++            "--device",
++            device,
++        ]
++        if mode == "resemble-enhance":
++            command += [
++                "--nfe",
++                str(int(options.get("nfe", 32))),
++                "--solver",
++                str(options.get("solver", "midpoint")),
++                "--lambd",
++                str(float(options.get("lambd", 0.5))),
++                "--tau",
++                str(float(options.get("tau", 0.5))),
++            ]
++        env = dict(os.environ)
++        # VoiceFixer caches under ~/.cache; keep it inside the sidecar root.
++        home = _env_dir(mode) / "home"
++        home.mkdir(parents=True, exist_ok=True)
++        env["HOME"] = env["USERPROFILE"] = str(home)
++        _run(command, env=env)
++
++        restored, out_rate = sf.read(target, dtype="float32", always_2d=False)
++        if restored.ndim > 1:
++            restored = restored.mean(axis=1)
++        if out_rate != sample_rate:
++            restored = soxr.resample(restored, out_rate, int(sample_rate))
++
++    length = len(data)
++    if len(restored) >= length:
++        restored = restored[:length]
++    else:
++        restored = np.pad(restored, (0, length - len(restored)))
++    restored = restored.astype(np.float32)
++    _cache_put(cache_folder, cache_path, restored)
++    return restored
+diff --git a/rvc/lib/tools/audio_restore_worker.py b/rvc/lib/tools/audio_restore_worker.py
+new file mode 100644
+index 0000000..f16675a
+--- /dev/null
++++ b/rvc/lib/tools/audio_restore_worker.py
+@@ -0,0 +1,111 @@
++"""Sidecar entry point for audio restoration.
++
++Runs inside the isolated restoration environment, never inside Applio's own
++interpreter, so the restoration packages cannot disturb Applio's pinned
++dependencies. Imports nothing from the rvc package.
++
++Usage (launched by audio_restore.py with the sidecar's python -I):
++    worker.py --backend {voicefixer,resemble-enhance} --input in.wav \
++        --output out.wav --device {cpu,cuda} [--nfe N] [--solver S] \
++        [--lambd F] [--tau F]
++"""
++
++import argparse
++import importlib.util
++import sys
++import types
++
++
++def _stand_in_for_deepspeed():
++    """Provide inert deepspeed modules when the real package is absent.
++
++    resemble_enhance imports deepspeed at module level for its training code.
++    Inference never calls into it, and the real package is large and does not
++    install on Windows, so a stand-in satisfies the imports.
++    """
++    if importlib.util.find_spec("deepspeed") is not None:
++        return
++
++    def module(name, **members):
++        mod = types.ModuleType(name)
++        mod.__dict__.update(members)
++        sys.modules[name] = mod
++        return mod
++
++    def unavailable(*_args, **_kwargs):
++        raise RuntimeError("deepspeed is not installed; training is unsupported")
++
++    root = module("deepspeed", DeepSpeedConfig=type("DeepSpeedConfig", (), {}))
++    accelerator = module("deepspeed.accelerator", get_accelerator=unavailable)
++    runtime = module("deepspeed.runtime")
++    engine = module(
++        "deepspeed.runtime.engine", DeepSpeedEngine=type("DeepSpeedEngine", (), {})
++    )
++    utils = module("deepspeed.runtime.utils", clip_grad_norm_=unavailable)
++    root.accelerator, root.runtime = accelerator, runtime
++    runtime.engine, runtime.utils = engine, utils
++
++
++def run_voicefixer(args):
++    from voicefixer import VoiceFixer
++
++    # mode 0 is the default general-purpose restoration path.
++    restorer = VoiceFixer()
++    restorer.restore(
++        input=args.input,
++        output=args.output,
++        cuda=args.device == "cuda",
++        mode=0,
++    )
++
++
++def run_resemble_enhance(args):
++    import numpy as np
++    import soundfile as sf
++    import torch
++
++    _stand_in_for_deepspeed()
++    from resemble_enhance.enhancer.inference import enhance
++
++    # soundfile instead of torchaudio.load/save: recent torchaudio builds
++    # route file I/O through TorchCodec, which is not pinned here.
++    data, sr = sf.read(args.input, dtype="float32", always_2d=True)
++    dwav = torch.from_numpy(np.ascontiguousarray(data.mean(axis=1)))
++    hwav, out_sr = enhance(
++        dwav,
++        sr,
++        args.device,
++        nfe=args.nfe,
++        solver=args.solver,
++        lambd=args.lambd,
++        tau=args.tau,
++    )
++    out = hwav.detach().cpu().float().numpy().reshape(-1)
++    sf.write(args.output, out, int(out_sr), subtype="FLOAT")
++
++
++BACKENDS = {
++    "voicefixer": run_voicefixer,
++    "resemble-enhance": run_resemble_enhance,
++}
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--backend", choices=sorted(BACKENDS), required=True)
++    parser.add_argument("--input", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
++    parser.add_argument("--nfe", type=int, default=32)
++    parser.add_argument(
++        "--solver", choices=("midpoint", "rk4", "euler"), default="midpoint"
++    )
++    parser.add_argument("--lambd", type=float, default=0.5)
++    parser.add_argument("--tau", type=float, default=0.5)
++    args = parser.parse_args(argv)
++    BACKENDS[args.backend](args)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/rvc/lib/utils.py b/rvc/lib/utils.py
+index 153beb4..b6fd435 100644
+--- a/rvc/lib/utils.py
++++ b/rvc/lib/utils.py
+@@ -157,6 +157,21 @@ def load_audio_infer(
+             audio = cleanup_audio(
+                 audio, sr, kwargs["cleanup_mode"], kwargs.get("cleanup_strength", 12)
+             )
++        restore_mode = kwargs.get("restore_mode", "off")
++        if restore_mode and restore_mode != "off":
++            # Runs at the file's native rate, before resampling, so the
++            # restorer sees the full-bandwidth signal.
++            from rvc.lib.tools.audio_restore import restore_audio
++
++            audio = restore_audio(
++                audio,
++                sr,
++                restore_mode,
++                nfe=kwargs.get("restore_nfe", 32),
++                solver=kwargs.get("restore_solver", "midpoint"),
++                lambd=kwargs.get("restore_lambd", 0.5),
++                tau=kwargs.get("restore_tau", 0.5),
++            )
+         if sr != sample_rate:
+             audio = librosa.resample(
+                 audio, orig_sr=sr, target_sr=sample_rate, res_type="soxr_vhq"
+diff --git a/tabs/inference/inference.py b/tabs/inference/inference.py
+index 711580b..09a693e 100644
+--- a/tabs/inference/inference.py
++++ b/tabs/inference/inference.py
+@@ -830,6 +830,31 @@ def inference_tab():
+                                 "Higher values remove more noise and can change the voice."
+                             ),
+                         )
++                    with gr.Accordion(i18n("Vocal restoration"), open=False):
++                        restore_mode = gr.Dropdown(
++                            label=i18n("Vocal restoration"),
++                            choices=[
++                                (i18n("Off"), "off"),
++                                (i18n("VoiceFixer"), "voicefixer"),
++                                (i18n("Resemble Enhance"), "resemble-enhance"),
++                            ],
++                            value="off",
++                            interactive=True,
++                            info=i18n(
++                                "Rebuilds garbled or rasped vocals before conversion. Runs locally. The first use installs a separate environment and downloads model weights."
++                            ),
++                        )
++                        f0_smooth = gr.Slider(
++                            minimum=0,
++                            maximum=15,
++                            step=1,
++                            value=0,
++                            label=i18n("Pitch smoothing (frames)"),
++                            interactive=True,
++                            info=i18n(
++                                "Smooths pitch jitter that often comes with rasp. 0 disables. Try 5."
++                            ),
++                        )
+                     with gr.Accordion(i18n("Formant Shifting"), open=False):
+                         formant_shifting = gr.Checkbox(
+                             label=i18n("Formant Shifting"),
+@@ -960,7 +985,11 @@ def inference_tab():
+                     try:
+                         gr.Info(i18n("Converting audio..."))
+                         result = run_infer_script(
+-                            *args[:-2], cleanup_mode=args[-2], cleanup_strength=args[-1]
++                            *args[:-4],
++                            cleanup_mode=args[-4],
++                            cleanup_strength=args[-3],
++                            restore_mode=args[-2],
++                            f0_smooth=int(args[-1]),
+                         )
+                         gr.Info(result[0])
+                         return result
+@@ -1528,6 +1557,8 @@ def inference_tab():
+             sid,
+             cleanup_mode,
+             cleanup_strength,
++            restore_mode,
++            f0_smooth,
+         ],
+         outputs=[vc_output1, vc_output2],
+     )
+-- 
+2.43.0
+
