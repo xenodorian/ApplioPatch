@@ -167,7 +167,7 @@ def main(argv=None):
     parser.add_argument(
         "--solver", choices=("midpoint", "rk4", "euler"), default="midpoint"
     )
-    parser.add_argument("--lambd", type=float, default=0.5)
+    parser.add_argument("--lambd", type=float, default=0.1)
     parser.add_argument("--tau", type=float, default=0.5)
     args = parser.parse_args(argv)
     if args.device == "cuda":

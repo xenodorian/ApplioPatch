@@ -1,5 +1,5 @@
 diff --git a/core.py b/core.py
-index 160595a..fed0846 100644
+index 160595a..66bdbd8 100644
 --- a/core.py
 +++ b/core.py
 @@ -118,6 +118,13 @@ def run_infer_script(
@@ -10,7 +10,7 @@ index 160595a..fed0846 100644
 +    restore_blend: float = 1.0,
 +    restore_nfe: int = 32,
 +    restore_solver: str = "midpoint",
-+    restore_lambd: float = 0.5,
++    restore_lambd: float = 0.1,
 +    restore_tau: float = 0.5,
 +    f0_smooth: int = 0,
  ):
@@ -38,7 +38,7 @@ index 160595a..fed0846 100644
 +    restore_blend: float = 1.0,
 +    restore_nfe: int = 32,
 +    restore_solver: str = "midpoint",
-+    restore_lambd: float = 0.5,
++    restore_lambd: float = 0.1,
 +    restore_tau: float = 0.5,
 +    f0_smooth: int = 0,
  ):
@@ -136,288 +136,12 @@ index 5dac3bb..2e389c5 100644
              )
              pitch = pitch[:p_len]
              pitchf = pitchf[:p_len]
-diff --git a/rvc/lib/utils.py b/rvc/lib/utils.py
-index fe2321b..8712d8f 100644
---- a/rvc/lib/utils.py
-+++ b/rvc/lib/utils.py
-@@ -73,6 +73,22 @@ def load_audio_infer(
-         audio, sr = sf.read(file)
-         if len(audio.shape) > 1:
-             audio = librosa.to_mono(audio.T)
-+        restore_mode = kwargs.get("restore_mode", "off")
-+        if restore_mode and restore_mode != "off":
-+            # Runs at the file's native rate, before resampling, so the
-+            # restorer sees the full-bandwidth signal.
-+            from rvc.lib.tools.audio_restore import restore_audio
-+
-+            audio = restore_audio(
-+                audio,
-+                sr,
-+                restore_mode,
-+                blend=kwargs.get("restore_blend", 1.0),
-+                nfe=kwargs.get("restore_nfe", 32),
-+                solver=kwargs.get("restore_solver", "midpoint"),
-+                lambd=kwargs.get("restore_lambd", 0.5),
-+                tau=kwargs.get("restore_tau", 0.5),
-+            )
-         if sr != sample_rate:
-             audio = librosa.resample(
-                 audio, orig_sr=sr, target_sr=sample_rate, res_type="soxr_vhq"
-diff --git a/tabs/inference/inference.py b/tabs/inference/inference.py
-index debee19..4c2111c 100644
---- a/tabs/inference/inference.py
-+++ b/tabs/inference/inference.py
-@@ -497,6 +497,160 @@ def update_filter_visibility(_):
- 
- 
- # Inference tab
-+RESTORE_KEYS = (
-+    "restore_mode",
-+    "restore_blend",
-+    "restore_nfe",
-+    "restore_solver",
-+    "restore_lambd",
-+    "restore_tau",
-+    "f0_smooth",
-+)
-+
-+
-+def split_restore_args(args):
-+    """Split the trailing restoration values off a positional argument list."""
-+    count = len(RESTORE_KEYS)
-+    values = args[-count:]
-+    options = dict(zip(RESTORE_KEYS, values))
-+    options["restore_nfe"] = int(options["restore_nfe"])
-+    options["f0_smooth"] = int(options["f0_smooth"])
-+    return args[:-count], options
-+
-+
-+def first_run_notice(mode):
-+    """Tell the user up front when a restorer still has to be installed."""
-+    if mode in (None, "off"):
-+        return
-+    try:
-+        from rvc.lib.tools.audio_restore import sidecar_ready
-+
-+        if not sidecar_ready(mode):
-+            gr.Info(
-+                i18n(
-+                    "First use of this restorer: installing it now. This can take a long time and needs internet. Progress is shown in the console window. Keep this page open."
-+                )
-+            )
-+    except Exception:
-+        pass
-+
-+
-+def restoration_controls(with_preview=False):
-+    """Vocal restoration panel. Returns the components in RESTORE_KEYS order."""
-+    with gr.Accordion(i18n("Vocal restoration"), open=False):
-+        gr.Markdown(
-+            i18n(
-+                "Rebuilds garbled, rasped or damaged vocals before conversion so the voice model does not copy the damage. Runs locally. The first use installs a separate environment (several GB) and downloads model weights, which can take a long time. Progress is shown in the console window."
-+            )
-+        )
-+        mode = gr.Dropdown(
-+            label=i18n("Restoration method"),
-+            choices=[
-+                (i18n("Off"), "off"),
-+                (i18n("VoiceFixer (fast, general repair)"), "voicefixer"),
-+                (
-+                    i18n("Resemble Enhance (slower, stronger rebuild)"),
-+                    "resemble-enhance",
-+                ),
-+            ],
-+            value="off",
-+            interactive=True,
-+        )
-+        blend = gr.Slider(
-+            minimum=0,
-+            maximum=1,
-+            step=0.05,
-+            value=1.0,
-+            label=i18n("Restoration strength"),
-+            info=i18n(
-+                "1.0 uses only the restored audio. Lower values mix some of the original back in. Changing this is instant after the first run."
-+            ),
-+            interactive=True,
-+        )
-+        with gr.Accordion(i18n("Resemble Enhance tuning"), open=False):
-+            nfe = gr.Slider(
-+                minimum=1,
-+                maximum=128,
-+                step=1,
-+                value=32,
-+                label=i18n("Quality steps (NFE)"),
-+                info=i18n("Higher is slower and cleaner. 32 is a good default."),
-+                interactive=True,
-+            )
-+            solver = gr.Dropdown(
-+                label=i18n("Solver"),
-+                choices=["midpoint", "rk4", "euler"],
-+                value="midpoint",
-+                interactive=True,
-+            )
-+            lambd = gr.Slider(
-+                minimum=0,
-+                maximum=1,
-+                step=0.05,
-+                value=0.5,
-+                label=i18n("Denoising strength"),
-+                info=i18n("Higher removes more noise and can thin the voice."),
-+                interactive=True,
-+            )
-+            tau = gr.Slider(
-+                minimum=0,
-+                maximum=1,
-+                step=0.05,
-+                value=0.5,
-+                label=i18n("Prior temperature"),
-+                info=i18n("Higher adds more generated detail."),
-+                interactive=True,
-+            )
-+        f0_smooth = gr.Slider(
-+            minimum=0,
-+            maximum=15,
-+            step=1,
-+            value=0,
-+            label=i18n("Pitch smoothing (frames)"),
-+            info=i18n(
-+                "Smooths pitch jitter that often comes with rasp. 0 disables. Try 5."
-+            ),
-+            interactive=True,
-+        )
-+        components = [mode, blend, nfe, solver, lambd, tau, f0_smooth]
-+        preview = None
-+        if with_preview:
-+            preview_button = gr.Button(i18n("Preview restoration only"))
-+            preview_status = gr.Textbox(
-+                label=i18n("Restoration status"), interactive=False
-+            )
-+            preview_audio = gr.Audio(label=i18n("Restored audio preview"))
-+            preview = (preview_button, preview_status, preview_audio)
-+    return components, preview
-+
-+
-+def preview_restoration(audio_path, mode, blend, nfe, solver, lambd, tau):
-+    """Restore the selected audio without converting it, for auditioning."""
-+    if not audio_path:
-+        gr.Info(i18n("Select an audio file first."))
-+        return i18n("No audio selected."), None
-+    if mode == "off":
-+        gr.Info(i18n("Choose a restoration method first."))
-+        return i18n("Restoration is off."), None
-+    try:
-+        first_run_notice(mode)
-+        from rvc.lib.tools.audio_restore import restore_file
-+
-+        out = restore_file(
-+            audio_path,
-+            mode,
-+            blend=float(blend),
-+            nfe=int(nfe),
-+            solver=solver,
-+            lambd=float(lambd),
-+            tau=float(tau),
-+        )
-+        return i18n("Restored successfully."), out
-+    except Exception as error:
-+        traceback.print_exc()
-+        return f"{i18n('Restoration failed')}: {error}", None
-+
-+
- def inference_tab():
-     trigger = get_filter_trigger()
-     with gr.Column():
-@@ -671,6 +825,9 @@ def inference_tab():
-                     value=0.5,
-                     interactive=True,
-                 )
-+                restore_components, restore_preview = restoration_controls(
-+                    with_preview=True
-+                )
-                 formant_shifting = gr.Checkbox(
-                     label=i18n("Formant Shifting"),
-                     info=i18n(
-@@ -1169,11 +1326,14 @@ def inference_tab():
-                 gr.Info(message)
-                 return message, None
-             try:
--                return run_infer_script(*args)
--            except Exception:
-+                base_args, restore_options = split_restore_args(args)
-+                first_run_notice(restore_options["restore_mode"])
-+                return run_infer_script(*base_args, **restore_options)
-+            except Exception as error:
-                 traceback.print_exc()
-                 return (
--                    "An error occurred during audio conversion. Please check the console logs for more details.",
-+                    "An error occurred during audio conversion. Please check the console logs for more details. "
-+                    + str(error)[:300],
-                     None,
-                 )
- 
-@@ -1183,10 +1343,15 @@ def inference_tab():
-                 gr.Info(message)
-                 return message
-             try:
--                return run_batch_infer_script(*args)
--            except Exception:
-+                base_args, restore_options = split_restore_args(args)
-+                first_run_notice(restore_options["restore_mode"])
-+                return run_batch_infer_script(*base_args, **restore_options)
-+            except Exception as error:
-                 traceback.print_exc()
--                return "An error occurred during audio batch conversion. Please check the console logs for more details."
-+                return (
-+                    "An error occurred during audio batch conversion. Please check the console logs for more details. "
-+                    + str(error)[:300]
-+                )
- 
-         terms_checkbox = gr.Checkbox(
-             label=i18n("I agree to the terms of use"),
-@@ -1314,6 +1479,7 @@ def inference_tab():
-                     value=0.5,
-                     interactive=True,
-                 )
-+                restore_components_batch, _ = restoration_controls()
-                 formant_shifting_batch = gr.Checkbox(
-                     label=i18n("Formant Shifting"),
-                     info=i18n(
-@@ -2199,6 +2365,12 @@ def inference_tab():
-         inputs=[],
-         outputs=[embedder_model_custom_batch],
-     )
-+    preview_button, preview_status, preview_audio = restore_preview
-+    preview_button.click(
-+        fn=preview_restoration,
-+        inputs=[audio, *restore_components[:6]],
-+        outputs=[preview_status, preview_audio],
-+    )
-     convert_button1.click(
-         fn=enforce_terms,
-         inputs=[
-@@ -2262,6 +2434,7 @@ def inference_tab():
-             delay_feedback,
-             delay_mix,
-             sid,
-+            *restore_components,
-         ],
-         outputs=[vc_output1, vc_output2],
-     )
-@@ -2332,6 +2505,7 @@ def inference_tab():
-             delay_feedback_batch,
-             delay_mix_batch,
-             sid_batch,
-+            *restore_components_batch,
-         ],
-         outputs=[vc_output3],
-     ).then(
 diff --git a/rvc/lib/tools/audio_restore.py b/rvc/lib/tools/audio_restore.py
 new file mode 100644
-index 0000000..2666d95
+index 0000000..966a91a
 --- /dev/null
 +++ b/rvc/lib/tools/audio_restore.py
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,691 @@
 +"""Optional vocal restoration before conversion (VoiceFixer, Resemble Enhance).
 +
 +Both restorers depend on packages that conflict with Applio's pinned stack
@@ -844,6 +568,144 @@ index 0000000..2666d95
 +    return mixed.astype(np.float32)
 +
 +
++# --- Guard -------------------------------------------------------------
++# Both restorers are trained on speech. On singing they can erase quiet
++# passages (breaths, note tails) and move the pitch. The guard compares the
++# restored audio with the original, at the 16 kHz that voice conversion
++# actually uses, and falls back to the original wherever the restorer
++# removed too much level or shifted the pitch. Everywhere else the restored
++# audio is kept. Switches are short crossfades.
++
++GUARD_DEFAULTS = {"max_drop_db": 4.0, "max_cents": 50.0}
++GUARD_RATE = 16000
++GUARD_HOP = 160  # 10 ms at 16 kHz
++
++
++def _envelope(x, rate, block_ms=0.25):
++    """Rectified, block-averaged signal with its slow trend removed."""
++    block = max(1, int(rate * block_ms / 1000))
++    n = len(x) // block * block
++    env = np.abs(x[:n]).reshape(-1, block).mean(axis=1)
++    from scipy.ndimage import uniform_filter1d
++
++    return env - uniform_filter1d(env, 200), block
++
++
++def estimate_lag(original, restored, rate, max_ms=20.0, segments=5, seconds=6):
++    """Time offset of `restored` against `original`, in samples, or 0.
++
++    A generative restorer rebuilds the waveform, so sample-level correlation
++    is unreliable. The loudness envelope survives, so the offset is read from
++    that, on several of the loudest segments. If the segments disagree the
++    audio is left unshifted rather than shifted by a bad guess.
++    """
++    from scipy.signal import correlate
++
++    n = min(len(original), len(restored))
++    span = int(seconds * rate)
++    if n < span * 2:
++        return 0
++    hops = np.arange(0, n - span, span)
++    energy = np.array([np.abs(original[h : h + span]).mean() for h in hops])
++    picks = hops[np.argsort(energy)[::-1][:segments]]
++    lags = []
++    for start in picks:
++        eo, block = _envelope(original[start : start + span], rate)
++        er, _ = _envelope(restored[start : start + span], rate)
++        m = min(len(eo), len(er))
++        limit = int(max_ms / 1000 * rate / block)
++        c = correlate(er[:m], eo[:m], mode="full", method="fft")
++        mid = m - 1
++        window = c[mid - limit : mid + limit + 1]
++        lags.append((int(np.argmax(window)) - limit) * block)
++    lags = np.array(lags)
++    spread = lags.max() - lags.min()
++    if spread > rate * 0.002:  # segments disagree by more than 2 ms
++        return 0
++    return int(np.median(lags))
++
++
++def _shift(x, lag):
++    """Move `x` earlier by `lag` samples (a delayed signal has lag > 0)."""
++    if lag == 0:
++        return x
++    out = np.zeros_like(x)
++    if lag > 0:
++        out[:-lag] = x[lag:]
++    else:
++        out[-lag:] = x[:lag]
++    return out
++
++
++def _levels_db(x16):
++    import librosa
++
++    rms = librosa.feature.rms(y=x16, frame_length=640, hop_length=GUARD_HOP)[0]
++    return 20 * np.log10(rms + 1e-7)
++
++
++def _pitch(x16):
++    import librosa
++
++    return librosa.yin(
++        x16, fmin=70, fmax=1100, sr=GUARD_RATE, frame_length=1024, hop_length=GUARD_HOP
++    )
++
++
++def guard_weights(original, restored, rate, max_drop_db=4.0, max_cents=50.0):
++    """Per-sample weight of the ORIGINAL (0 = keep restored, 1 = keep original).
++
++    Returns (weights, report). `restored` must already be aligned.
++    """
++    from scipy.ndimage import median_filter, uniform_filter1d, maximum_filter1d
++
++    o16 = soxr.resample(original, rate, GUARD_RATE)
++    r16 = soxr.resample(restored, rate, GUARD_RATE)
++    lo, lr = _levels_db(o16), _levels_db(r16)
++    n = min(len(lo), len(lr))
++    lo, lr = lo[:n], lr[:n]
++
++    audible = lo > -80.0  # digital silence is not "lost content"
++    drop = lo - lr
++    w_level = np.clip((drop - max_drop_db) / 6.0, 0.0, 1.0) * audible
++
++    fo, fr = _pitch(o16)[:n], _pitch(r16)[:n]
++    n = min(n, len(fo), len(fr))
++    cents = np.abs(1200 * np.log2(fr[:n] / fo[:n]))
++    loud = lo[:n] > np.percentile(lo[audible[:n]] if audible[:n].any() else lo[:n], 40)
++    w_pitch = ((cents > max_cents) & loud).astype(np.float64)
++    w_pitch = median_filter(w_pitch, size=5)
++
++    w = np.maximum(w_level[:n], w_pitch)
++    w = maximum_filter1d(w, size=5)  # widen by ~20 ms each side
++    w = uniform_filter1d(w, size=5)
++    frames = np.arange(n) * GUARD_HOP * rate / GUARD_RATE
++    per_sample = np.interp(np.arange(len(original)), frames, w)
++    per_sample = uniform_filter1d(per_sample, int(0.02 * rate))
++    report = {
++        "fraction_original": float(per_sample.mean()),
++        "frames_level": float((w_level[:n] > 0).mean()),
++        "frames_pitch": float(w_pitch.mean()),
++    }
++    return np.clip(per_sample, 0.0, 1.0), report
++
++
++def guard_restored(original, restored, rate, **options):
++    """Return `restored` with the original put back where the restorer broke it."""
++    params = {**GUARD_DEFAULTS, **{k: v for k, v in options.items() if k in GUARD_DEFAULTS}}
++    lag = estimate_lag(original, restored, rate)
++    aligned = _shift(restored, lag)
++    weights, report = guard_weights(original, aligned, rate, **params)
++    mixed = weights * original + (1.0 - weights) * aligned
++    print(
++        f"Audio restoration guard: kept original for {report['fraction_original']:.0%} "
++        f"of the audio (level {report['frames_level']:.0%}, pitch {report['frames_pitch']:.0%}), "
++        f"offset {lag} samples",
++        flush=True,
++    )
++    return mixed.astype(np.float32)
++
++
 +def restore_audio(audio, sample_rate, mode="off", **options):
 +    """Return restored mono float32 audio at the original rate and length.
 +
@@ -879,7 +741,11 @@ index 0000000..2666d95
 +        restored = _restore_with_sidecar(data, sample_rate, mode, options)
 +        _cache_put(cache_folder, cache_path, restored)
 +
-+    # The blend is applied after the cache, so changing it is instant.
++    # The guard and the blend are applied after the cache, so changing them
++    # is instant. The guard can be turned off with guard=False or by setting
++    # the environment variable APPLIO_RESTORE_GUARD=0.
++    if options.get("guard", True) and os.environ.get("APPLIO_RESTORE_GUARD", "1") != "0":
++        restored = guard_restored(data, restored, int(sample_rate), **options)
 +    return blend_restored(data, restored, options.get("blend", 1.0))
 +
 +
@@ -925,7 +791,7 @@ index 0000000..2666d95
 +                "--solver",
 +                str(options.get("solver", "midpoint")),
 +                "--lambd",
-+                str(float(options.get("lambd", 0.5))),
++                str(float(options.get("lambd", 0.1))),
 +                "--tau",
 +                str(float(options.get("tau", 0.5))),
 +            ]
@@ -969,7 +835,7 @@ index 0000000..2666d95
 +    return str(out)
 diff --git a/rvc/lib/tools/audio_restore_worker.py b/rvc/lib/tools/audio_restore_worker.py
 new file mode 100644
-index 0000000..60e95d0
+index 0000000..16449c9
 --- /dev/null
 +++ b/rvc/lib/tools/audio_restore_worker.py
 @@ -0,0 +1,186 @@
@@ -1142,7 +1008,7 @@ index 0000000..60e95d0
 +    parser.add_argument(
 +        "--solver", choices=("midpoint", "rk4", "euler"), default="midpoint"
 +    )
-+    parser.add_argument("--lambd", type=float, default=0.5)
++    parser.add_argument("--lambd", type=float, default=0.1)
 +    parser.add_argument("--tau", type=float, default=0.5)
 +    args = parser.parse_args(argv)
 +    if args.device == "cuda":
@@ -1159,3 +1025,279 @@ index 0000000..60e95d0
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
+diff --git a/rvc/lib/utils.py b/rvc/lib/utils.py
+index fe2321b..ed9030c 100644
+--- a/rvc/lib/utils.py
++++ b/rvc/lib/utils.py
+@@ -73,6 +73,22 @@ def load_audio_infer(
+         audio, sr = sf.read(file)
+         if len(audio.shape) > 1:
+             audio = librosa.to_mono(audio.T)
++        restore_mode = kwargs.get("restore_mode", "off")
++        if restore_mode and restore_mode != "off":
++            # Runs at the file's native rate, before resampling, so the
++            # restorer sees the full-bandwidth signal.
++            from rvc.lib.tools.audio_restore import restore_audio
++
++            audio = restore_audio(
++                audio,
++                sr,
++                restore_mode,
++                blend=kwargs.get("restore_blend", 1.0),
++                nfe=kwargs.get("restore_nfe", 32),
++                solver=kwargs.get("restore_solver", "midpoint"),
++                lambd=kwargs.get("restore_lambd", 0.1),
++                tau=kwargs.get("restore_tau", 0.5),
++            )
+         if sr != sample_rate:
+             audio = librosa.resample(
+                 audio, orig_sr=sr, target_sr=sample_rate, res_type="soxr_vhq"
+diff --git a/tabs/inference/inference.py b/tabs/inference/inference.py
+index debee19..421dfaf 100644
+--- a/tabs/inference/inference.py
++++ b/tabs/inference/inference.py
+@@ -497,6 +497,160 @@ def update_filter_visibility(_):
+ 
+ 
+ # Inference tab
++RESTORE_KEYS = (
++    "restore_mode",
++    "restore_blend",
++    "restore_nfe",
++    "restore_solver",
++    "restore_lambd",
++    "restore_tau",
++    "f0_smooth",
++)
++
++
++def split_restore_args(args):
++    """Split the trailing restoration values off a positional argument list."""
++    count = len(RESTORE_KEYS)
++    values = args[-count:]
++    options = dict(zip(RESTORE_KEYS, values))
++    options["restore_nfe"] = int(options["restore_nfe"])
++    options["f0_smooth"] = int(options["f0_smooth"])
++    return args[:-count], options
++
++
++def first_run_notice(mode):
++    """Tell the user up front when a restorer still has to be installed."""
++    if mode in (None, "off"):
++        return
++    try:
++        from rvc.lib.tools.audio_restore import sidecar_ready
++
++        if not sidecar_ready(mode):
++            gr.Info(
++                i18n(
++                    "First use of this restorer: installing it now. This can take a long time and needs internet. Progress is shown in the console window. Keep this page open."
++                )
++            )
++    except Exception:
++        pass
++
++
++def restoration_controls(with_preview=False):
++    """Vocal restoration panel. Returns the components in RESTORE_KEYS order."""
++    with gr.Accordion(i18n("Vocal restoration"), open=False):
++        gr.Markdown(
++            i18n(
++                "Experimental. Both restorers are trained on speech, not singing, and on a separated singing vocal they can erase quiet passages and shift pitch. A guard puts the original back where that happens, but always compare with Preview before converting. For separated vocals, a de-noise or de-reverb pass in UVR is usually the safer first step. Runs locally. The first use installs a separate environment (several GB) and downloads model weights, which can take a long time. Progress is shown in the console window."
++            )
++        )
++        mode = gr.Dropdown(
++            label=i18n("Restoration method"),
++            choices=[
++                (i18n("Off"), "off"),
++                (i18n("VoiceFixer (fast, general repair)"), "voicefixer"),
++                (
++                    i18n("Resemble Enhance (slower, stronger rebuild)"),
++                    "resemble-enhance",
++                ),
++            ],
++            value="off",
++            interactive=True,
++        )
++        blend = gr.Slider(
++            minimum=0,
++            maximum=1,
++            step=0.05,
++            value=1.0,
++            label=i18n("Restoration strength"),
++            info=i18n(
++                "1.0 uses only the restored audio (apart from the guard). Lower values mix some of the original back in. Changing this is instant after the first run."
++            ),
++            interactive=True,
++        )
++        with gr.Accordion(i18n("Resemble Enhance tuning"), open=False):
++            nfe = gr.Slider(
++                minimum=1,
++                maximum=128,
++                step=1,
++                value=32,
++                label=i18n("Quality steps (NFE)"),
++                info=i18n("Higher is slower and cleaner. 32 is a good default."),
++                interactive=True,
++            )
++            solver = gr.Dropdown(
++                label=i18n("Solver"),
++                choices=["midpoint", "rk4", "euler"],
++                value="midpoint",
++                interactive=True,
++            )
++            lambd = gr.Slider(
++                minimum=0,
++                maximum=1,
++                step=0.05,
++                value=0.1,
++                label=i18n("Denoising strength"),
++                info=i18n("Higher removes more noise and can thin or erase singing. Keep this low (0.1) for vocals."),
++                interactive=True,
++            )
++            tau = gr.Slider(
++                minimum=0,
++                maximum=1,
++                step=0.05,
++                value=0.5,
++                label=i18n("Prior temperature"),
++                info=i18n("Higher adds more generated detail."),
++                interactive=True,
++            )
++        f0_smooth = gr.Slider(
++            minimum=0,
++            maximum=15,
++            step=1,
++            value=0,
++            label=i18n("Pitch smoothing (frames)"),
++            info=i18n(
++                "Smooths pitch jitter that often comes with rasp. 0 disables. Try 5."
++            ),
++            interactive=True,
++        )
++        components = [mode, blend, nfe, solver, lambd, tau, f0_smooth]
++        preview = None
++        if with_preview:
++            preview_button = gr.Button(i18n("Preview restoration only"))
++            preview_status = gr.Textbox(
++                label=i18n("Restoration status"), interactive=False
++            )
++            preview_audio = gr.Audio(label=i18n("Restored audio preview"))
++            preview = (preview_button, preview_status, preview_audio)
++    return components, preview
++
++
++def preview_restoration(audio_path, mode, blend, nfe, solver, lambd, tau):
++    """Restore the selected audio without converting it, for auditioning."""
++    if not audio_path:
++        gr.Info(i18n("Select an audio file first."))
++        return i18n("No audio selected."), None
++    if mode == "off":
++        gr.Info(i18n("Choose a restoration method first."))
++        return i18n("Restoration is off."), None
++    try:
++        first_run_notice(mode)
++        from rvc.lib.tools.audio_restore import restore_file
++
++        out = restore_file(
++            audio_path,
++            mode,
++            blend=float(blend),
++            nfe=int(nfe),
++            solver=solver,
++            lambd=float(lambd),
++            tau=float(tau),
++        )
++        return i18n("Restored successfully."), out
++    except Exception as error:
++        traceback.print_exc()
++        return f"{i18n('Restoration failed')}: {error}", None
++
++
+ def inference_tab():
+     trigger = get_filter_trigger()
+     with gr.Column():
+@@ -671,6 +825,9 @@ def inference_tab():
+                     value=0.5,
+                     interactive=True,
+                 )
++                restore_components, restore_preview = restoration_controls(
++                    with_preview=True
++                )
+                 formant_shifting = gr.Checkbox(
+                     label=i18n("Formant Shifting"),
+                     info=i18n(
+@@ -1169,11 +1326,14 @@ def inference_tab():
+                 gr.Info(message)
+                 return message, None
+             try:
+-                return run_infer_script(*args)
+-            except Exception:
++                base_args, restore_options = split_restore_args(args)
++                first_run_notice(restore_options["restore_mode"])
++                return run_infer_script(*base_args, **restore_options)
++            except Exception as error:
+                 traceback.print_exc()
+                 return (
+-                    "An error occurred during audio conversion. Please check the console logs for more details.",
++                    "An error occurred during audio conversion. Please check the console logs for more details. "
++                    + str(error)[:300],
+                     None,
+                 )
+ 
+@@ -1183,10 +1343,15 @@ def inference_tab():
+                 gr.Info(message)
+                 return message
+             try:
+-                return run_batch_infer_script(*args)
+-            except Exception:
++                base_args, restore_options = split_restore_args(args)
++                first_run_notice(restore_options["restore_mode"])
++                return run_batch_infer_script(*base_args, **restore_options)
++            except Exception as error:
+                 traceback.print_exc()
+-                return "An error occurred during audio batch conversion. Please check the console logs for more details."
++                return (
++                    "An error occurred during audio batch conversion. Please check the console logs for more details. "
++                    + str(error)[:300]
++                )
+ 
+         terms_checkbox = gr.Checkbox(
+             label=i18n("I agree to the terms of use"),
+@@ -1314,6 +1479,7 @@ def inference_tab():
+                     value=0.5,
+                     interactive=True,
+                 )
++                restore_components_batch, _ = restoration_controls()
+                 formant_shifting_batch = gr.Checkbox(
+                     label=i18n("Formant Shifting"),
+                     info=i18n(
+@@ -2199,6 +2365,12 @@ def inference_tab():
+         inputs=[],
+         outputs=[embedder_model_custom_batch],
+     )
++    preview_button, preview_status, preview_audio = restore_preview
++    preview_button.click(
++        fn=preview_restoration,
++        inputs=[audio, *restore_components[:6]],
++        outputs=[preview_status, preview_audio],
++    )
+     convert_button1.click(
+         fn=enforce_terms,
+         inputs=[
+@@ -2262,6 +2434,7 @@ def inference_tab():
+             delay_feedback,
+             delay_mix,
+             sid,
++            *restore_components,
+         ],
+         outputs=[vc_output1, vc_output2],
+     )
+@@ -2332,6 +2505,7 @@ def inference_tab():
+             delay_feedback_batch,
+             delay_mix_batch,
+             sid_batch,
++            *restore_components_batch,
+         ],
+         outputs=[vc_output3],
+     ).then(
