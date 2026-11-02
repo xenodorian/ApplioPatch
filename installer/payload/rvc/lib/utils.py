@@ -86,7 +86,7 @@ def load_audio_infer(
                 blend=kwargs.get("restore_blend", 1.0),
                 nfe=kwargs.get("restore_nfe", 32),
                 solver=kwargs.get("restore_solver", "midpoint"),
-                lambd=kwargs.get("restore_lambd", 0.5),
+                lambd=kwargs.get("restore_lambd", 0.1),
                 tau=kwargs.get("restore_tau", 0.5),
             )
         if sr != sample_rate:

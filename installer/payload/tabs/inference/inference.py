@@ -540,7 +540,7 @@ def restoration_controls(with_preview=False):
     with gr.Accordion(i18n("Vocal restoration"), open=False):
         gr.Markdown(
             i18n(
-                "Rebuilds garbled, rasped or damaged vocals before conversion so the voice model does not copy the damage. Runs locally. The first use installs a separate environment (several GB) and downloads model weights, which can take a long time. Progress is shown in the console window."
+                "Experimental. Both restorers are trained on speech, not singing, and on a separated singing vocal they can erase quiet passages and shift pitch. A guard puts the original back where that happens, but always compare with Preview before converting. For separated vocals, a de-noise or de-reverb pass in UVR is usually the safer first step. Runs locally. The first use installs a separate environment (several GB) and downloads model weights, which can take a long time. Progress is shown in the console window."
             )
         )
         mode = gr.Dropdown(
@@ -563,7 +563,7 @@ def restoration_controls(with_preview=False):
             value=1.0,
             label=i18n("Restoration strength"),
             info=i18n(
-                "1.0 uses only the restored audio. Lower values mix some of the original back in. Changing this is instant after the first run."
+                "1.0 uses only the restored audio (apart from the guard). Lower values mix some of the original back in. Changing this is instant after the first run."
             ),
             interactive=True,
         )
@@ -587,9 +587,9 @@ def restoration_controls(with_preview=False):
                 minimum=0,
                 maximum=1,
                 step=0.05,
-                value=0.5,
+                value=0.1,
                 label=i18n("Denoising strength"),
-                info=i18n("Higher removes more noise and can thin the voice."),
+                info=i18n("Higher removes more noise and can thin or erase singing. Keep this low (0.1) for vocals."),
                 interactive=True,
             )
             tau = gr.Slider(

@@ -424,6 +424,144 @@ def blend_restored(original, restored, blend):
     return mixed.astype(np.float32)
 
 
+# --- Guard -------------------------------------------------------------
+# Both restorers are trained on speech. On singing they can erase quiet
+# passages (breaths, note tails) and move the pitch. The guard compares the
+# restored audio with the original, at the 16 kHz that voice conversion
+# actually uses, and falls back to the original wherever the restorer
+# removed too much level or shifted the pitch. Everywhere else the restored
+# audio is kept. Switches are short crossfades.
+
+GUARD_DEFAULTS = {"max_drop_db": 4.0, "max_cents": 50.0}
+GUARD_RATE = 16000
+GUARD_HOP = 160  # 10 ms at 16 kHz
+
+
+def _envelope(x, rate, block_ms=0.25):
+    """Rectified, block-averaged signal with its slow trend removed."""
+    block = max(1, int(rate * block_ms / 1000))
+    n = len(x) // block * block
+    env = np.abs(x[:n]).reshape(-1, block).mean(axis=1)
+    from scipy.ndimage import uniform_filter1d
+
+    return env - uniform_filter1d(env, 200), block
+
+
+def estimate_lag(original, restored, rate, max_ms=20.0, segments=5, seconds=6):
+    """Time offset of `restored` against `original`, in samples, or 0.
+
+    A generative restorer rebuilds the waveform, so sample-level correlation
+    is unreliable. The loudness envelope survives, so the offset is read from
+    that, on several of the loudest segments. If the segments disagree the
+    audio is left unshifted rather than shifted by a bad guess.
+    """
+    from scipy.signal import correlate
+
+    n = min(len(original), len(restored))
+    span = int(seconds * rate)
+    if n < span * 2:
+        return 0
+    hops = np.arange(0, n - span, span)
+    energy = np.array([np.abs(original[h : h + span]).mean() for h in hops])
+    picks = hops[np.argsort(energy)[::-1][:segments]]
+    lags = []
+    for start in picks:
+        eo, block = _envelope(original[start : start + span], rate)
+        er, _ = _envelope(restored[start : start + span], rate)
+        m = min(len(eo), len(er))
+        limit = int(max_ms / 1000 * rate / block)
+        c = correlate(er[:m], eo[:m], mode="full", method="fft")
+        mid = m - 1
+        window = c[mid - limit : mid + limit + 1]
+        lags.append((int(np.argmax(window)) - limit) * block)
+    lags = np.array(lags)
+    spread = lags.max() - lags.min()
+    if spread > rate * 0.002:  # segments disagree by more than 2 ms
+        return 0
+    return int(np.median(lags))
+
+
+def _shift(x, lag):
+    """Move `x` earlier by `lag` samples (a delayed signal has lag > 0)."""
+    if lag == 0:
+        return x
+    out = np.zeros_like(x)
+    if lag > 0:
+        out[:-lag] = x[lag:]
+    else:
+        out[-lag:] = x[:lag]
+    return out
+
+
+def _levels_db(x16):
+    import librosa
+
+    rms = librosa.feature.rms(y=x16, frame_length=640, hop_length=GUARD_HOP)[0]
+    return 20 * np.log10(rms + 1e-7)
+
+
+def _pitch(x16):
+    import librosa
+
+    return librosa.yin(
+        x16, fmin=70, fmax=1100, sr=GUARD_RATE, frame_length=1024, hop_length=GUARD_HOP
+    )
+
+
+def guard_weights(original, restored, rate, max_drop_db=4.0, max_cents=50.0):
+    """Per-sample weight of the ORIGINAL (0 = keep restored, 1 = keep original).
+
+    Returns (weights, report). `restored` must already be aligned.
+    """
+    from scipy.ndimage import median_filter, uniform_filter1d, maximum_filter1d
+
+    o16 = soxr.resample(original, rate, GUARD_RATE)
+    r16 = soxr.resample(restored, rate, GUARD_RATE)
+    lo, lr = _levels_db(o16), _levels_db(r16)
+    n = min(len(lo), len(lr))
+    lo, lr = lo[:n], lr[:n]
+
+    audible = lo > -80.0  # digital silence is not "lost content"
+    drop = lo - lr
+    w_level = np.clip((drop - max_drop_db) / 6.0, 0.0, 1.0) * audible
+
+    fo, fr = _pitch(o16)[:n], _pitch(r16)[:n]
+    n = min(n, len(fo), len(fr))
+    cents = np.abs(1200 * np.log2(fr[:n] / fo[:n]))
+    loud = lo[:n] > np.percentile(lo[audible[:n]] if audible[:n].any() else lo[:n], 40)
+    w_pitch = ((cents > max_cents) & loud).astype(np.float64)
+    w_pitch = median_filter(w_pitch, size=5)
+
+    w = np.maximum(w_level[:n], w_pitch)
+    w = maximum_filter1d(w, size=5)  # widen by ~20 ms each side
+    w = uniform_filter1d(w, size=5)
+    frames = np.arange(n) * GUARD_HOP * rate / GUARD_RATE
+    per_sample = np.interp(np.arange(len(original)), frames, w)
+    per_sample = uniform_filter1d(per_sample, int(0.02 * rate))
+    report = {
+        "fraction_original": float(per_sample.mean()),
+        "frames_level": float((w_level[:n] > 0).mean()),
+        "frames_pitch": float(w_pitch.mean()),
+    }
+    return np.clip(per_sample, 0.0, 1.0), report
+
+
+def guard_restored(original, restored, rate, **options):
+    """Return `restored` with the original put back where the restorer broke it."""
+    params = {**GUARD_DEFAULTS, **{k: v for k, v in options.items() if k in GUARD_DEFAULTS}}
+    lag = estimate_lag(original, restored, rate)
+    aligned = _shift(restored, lag)
+    weights, report = guard_weights(original, aligned, rate, **params)
+    mixed = weights * original + (1.0 - weights) * aligned
+    print(
+        f"Audio restoration guard: kept original for {report['fraction_original']:.0%} "
+        f"of the audio (level {report['frames_level']:.0%}, pitch {report['frames_pitch']:.0%}), "
+        f"offset {lag} samples",
+        flush=True,
+    )
+    return mixed.astype(np.float32)
+
+
 def restore_audio(audio, sample_rate, mode="off", **options):
     """Return restored mono float32 audio at the original rate and length.
 
@@ -459,7 +597,11 @@ def restore_audio(audio, sample_rate, mode="off", **options):
         restored = _restore_with_sidecar(data, sample_rate, mode, options)
         _cache_put(cache_folder, cache_path, restored)
 
-    # The blend is applied after the cache, so changing it is instant.
+    # The guard and the blend are applied after the cache, so changing them
+    # is instant. The guard can be turned off with guard=False or by setting
+    # the environment variable APPLIO_RESTORE_GUARD=0.
+    if options.get("guard", True) and os.environ.get("APPLIO_RESTORE_GUARD", "1") != "0":
+        restored = guard_restored(data, restored, int(sample_rate), **options)
     return blend_restored(data, restored, options.get("blend", 1.0))
 
 
@@ -505,7 +647,7 @@ def _run_sidecar(python, data, sample_rate, mode, options, device):
                 "--solver",
                 str(options.get("solver", "midpoint")),
                 "--lambd",
-                str(float(options.get("lambd", 0.5))),
+                str(float(options.get("lambd", 0.1))),
                 "--tau",
                 str(float(options.get("tau", 0.5))),
             ]

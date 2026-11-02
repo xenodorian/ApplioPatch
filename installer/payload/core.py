@@ -122,7 +122,7 @@ def run_infer_script(
     restore_blend: float = 1.0,
     restore_nfe: int = 32,
     restore_solver: str = "midpoint",
-    restore_lambd: float = 0.5,
+    restore_lambd: float = 0.1,
     restore_tau: float = 0.5,
     f0_smooth: int = 0,
 ):
@@ -266,7 +266,7 @@ def run_batch_infer_script(
     restore_blend: float = 1.0,
     restore_nfe: int = 32,
     restore_solver: str = "midpoint",
-    restore_lambd: float = 0.5,
+    restore_lambd: float = 0.1,
     restore_tau: float = 0.5,
     f0_smooth: int = 0,
 ):
