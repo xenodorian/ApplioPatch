@@ -74,8 +74,13 @@ SPECS = {
             "tabulate",
             "matplotlib",
         ],
+        # Each entry lists alternative sources for one package, tried in order.
+        # The zip needs no git; the git source is the fallback.
         "nodeps": [
-            "resemble-enhance @ git+https://github.com/resemble-ai/resemble-enhance.git@8e978149bfe8abab3eb77d965d579a111afdb0ff",
+            [
+                "resemble-enhance @ https://github.com/resemble-ai/resemble-enhance/archive/8e978149bfe8abab3eb77d965d579a111afdb0ff.zip",
+                "resemble-enhance @ git+https://github.com/resemble-ai/resemble-enhance.git@8e978149bfe8abab3eb77d965d579a111afdb0ff",
+            ],
         ],
     },
 }
@@ -83,8 +88,35 @@ SPECS = {
 MODES = ("off", "voicefixer", "resemble-enhance")
 
 
+MAX_ROOT_LENGTH = 70
+MIN_FREE_GB = 10
+
+
 def _root():
-    return APPLIO_ROOT / "assets" / "audio-restore"
+    """Where sidecar environments live.
+
+    Normally inside the Applio folder. Windows limits paths to 260
+    characters and PyTorch has very long internal file names, so a deeply
+    nested Applio folder falls back to a short folder at the drive root.
+    """
+    default = APPLIO_ROOT / "assets" / "audio-restore"
+    if os.name == "nt" and len(str(default)) > MAX_ROOT_LENGTH:
+        return Path(APPLIO_ROOT.anchor) / "applio-ar"
+    return default
+
+
+def sidecar_ready(backend):
+    """True when the restorer's environment is already installed."""
+    env = _env_dir(backend)
+    marker = env / "applio-spec.json"
+    try:
+        return (
+            _venv_python(env).exists()
+            and marker.exists()
+            and marker.read_text() == json.dumps(SPECS[backend], sort_keys=True)
+        )
+    except OSError:
+        return False
 
 
 def _env_dir(backend):
@@ -95,6 +127,51 @@ def _venv_python(env):
     if os.name == "nt":
         return env / "Scripts" / "python.exe"
     return env / "bin" / "python"
+
+
+FAILURE_HINTS = (
+    (("out of memory",), "Out of memory. Try a shorter file or close other programs."),
+    (
+        ("no space left", "not enough space", "os error 112", "errno 28"),
+        "The drive is out of space. Free at least 10 GB and try again.",
+    ),
+    (
+        ("filename too long", "winerror 206", "os error 206", "path too long"),
+        "A file path is too long for Windows. Move the Applio folder to a shorter path such as D:\\Applio, or enable Windows long paths.",
+    ),
+    (
+        ("access is denied", "permission denied"),
+        "Access was denied. Antivirus software or Windows Controlled folder access may be blocking the Applio folder.",
+    ),
+    (
+        ("git executable not found", "cannot find git", "'git'"),
+        "Git is not installed. Install Git for Windows from git-scm.com and try again.",
+    ),
+    (
+        (
+            "failed to fetch",
+            "tunnel error",
+            "connection",
+            "timed out",
+            "timeout",
+            "name or service not known",
+            "getaddrinfo",
+            "ssl error",
+            "certificate",
+            "forbidden",
+        ),
+        "A download failed. Check your internet connection and that a firewall, VPN or antivirus is not blocking github.com, pypi.org, huggingface.co or zenodo.org.",
+    ),
+)
+
+
+def explain_failure(text):
+    """Plain-language hint for a failed install or restoration, or ''."""
+    lowered = text.lower()
+    for needles, hint in FAILURE_HINTS:
+        if any(needle in lowered for needle in needles):
+            return hint
+    return ""
 
 
 def _run(command, env=None, timeout=TIMEOUT_SECONDS, label="Audio restoration"):
@@ -120,7 +197,12 @@ def _run(command, env=None, timeout=TIMEOUT_SECONDS, label="Audio restoration"):
     finally:
         timer.cancel()
     if process.returncode != 0:
-        raise RuntimeError(f"{label} failed:\n" + "\n".join(tail))
+        hint = explain_failure("\n".join(tail))
+        raise RuntimeError(
+            f"{label} failed. {hint}\n" + "\n".join(tail)
+            if hint
+            else f"{label} failed:\n" + "\n".join(tail)
+        )
 
 
 def _uv():
@@ -158,6 +240,7 @@ def ensure_sidecar(backend):
     if python.exists() and marker.exists() and marker.read_text() == wanted:
         return python
 
+    _preflight(backend)
     uv = _uv()
     label = f"Setup {backend}"
     print(
@@ -194,16 +277,53 @@ def ensure_sidecar(backend):
             if index == len(attempts) - 1:
                 raise
             print(f"Install attempt failed, trying the next option:\n{error}", flush=True)
-    if spec["nodeps"]:
-        _run(
-            base + ["--no-deps", *spec["nodeps"]],
-            timeout=INSTALL_TIMEOUT_SECONDS,
-            label=label,
-        )
+    for alternatives in spec["nodeps"]:
+        for index, source in enumerate(alternatives):
+            try:
+                _run(
+                    base + ["--no-deps", source],
+                    timeout=INSTALL_TIMEOUT_SECONDS,
+                    label=label,
+                )
+                break
+            except RuntimeError as error:
+                if index == len(alternatives) - 1:
+                    raise
+                print(f"Source failed, trying the next one:\n{error}", flush=True)
     marker.write_text(wanted)
     _remove_old_sidecars(backend, env)
     _report_gpu(python)
     return python
+
+
+def _preflight(backend):
+    """Fail early, in plain words, when an install cannot succeed."""
+    root = _root()
+    root.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(root).free / 1024**3
+    if free_gb < MIN_FREE_GB:
+        raise RuntimeError(
+            f"Not enough free disk space for the {backend} environment: "
+            f"{free_gb:.1f} GB free on {root.anchor or root}, at least {MIN_FREE_GB} GB needed."
+        )
+    import socket
+
+    hosts = ["pypi.org", "files.pythonhosted.org", "github.com"]
+    hosts.append("huggingface.co" if backend == "resemble-enhance" else "zenodo.org")
+    blocked = []
+    for host in hosts:
+        try:
+            socket.create_connection((host, 443), timeout=10).close()
+        except OSError:
+            blocked.append(host)
+    if blocked:
+        # A proxy can make this check fail while installs still work, so
+        # warn and carry on; a real failure is explained afterwards.
+        print(
+            "Warning: could not reach " + ", ".join(blocked) + ". "
+            "If the install fails, check your internet connection, firewall or VPN.",
+            flush=True,
+        )
 
 
 def _applio_torch_backend():
@@ -346,6 +466,18 @@ def restore_audio(audio, sample_rate, mode="off", **options):
 def _restore_with_sidecar(data, sample_rate, mode, options):
     python = ensure_sidecar(mode)
     device = options.get("device") or _device()
+    try:
+        return _run_sidecar(python, data, sample_rate, mode, options, device)
+    except RuntimeError as error:
+        # A GPU that runs out of memory on a long file can still do the job
+        # on the CPU, only slower.
+        if device == "cuda" and "out of memory" in str(error).lower():
+            print("GPU ran out of memory, retrying on the CPU...", flush=True)
+            return _run_sidecar(python, data, sample_rate, mode, options, "cpu")
+        raise
+
+
+def _run_sidecar(python, data, sample_rate, mode, options, device):
     print(f"Audio restoration: {mode} on {device}", flush=True)
 
     with tempfile.TemporaryDirectory(prefix="applio-restore-") as directory:

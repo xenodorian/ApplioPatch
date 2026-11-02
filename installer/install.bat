@@ -1,7 +1,12 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions DisableDelayedExpansion
 title Applio vocal restoration patch - install
 cd /d "%~dp0"
+echo "%~dp0"| findstr /c:"!" >nul
+if not errorlevel 1 goto err_bang
+setlocal EnableDelayedExpansion
+echo "%~dp0"| findstr /i /c:".zip" >nul
+if not errorlevel 1 goto err_zip
 
 set "PAYLOAD=%~dp0payload"
 set "STOCKFILE=%~dp0stock_hashes.txt"
@@ -112,6 +117,7 @@ echo.
 echo The first time you use a restorer, Applio downloads a large sidecar
 echo environment, about 6 GB for each restorer. Internet access is needed
 echo for that first use.
+echo Keep at least 12 GB free on the drive that holds Applio.
 echo.
 pause
 exit /b 0
@@ -160,6 +166,14 @@ goto fail
 :err_payfile
 echo ERROR: a payload file is missing: !MISSING!
 echo Extract the complete patch package and run this again.
+goto fail
+
+:err_bang
+echo ERROR: this folder path contains an exclamation mark. Move the patch folder to a path without one, such as C:\ApplioPatch, and run again.
+goto fail
+
+:err_zip
+echo ERROR: the patch seems to be running from inside a ZIP file or a temporary folder. Extract the whole ZIP to a normal folder first, then run install.bat again.
 goto fail
 
 rem ---- Subroutines ----
@@ -278,10 +292,12 @@ if not exist "!CPDIR!" mkdir "!CPDIR!"
 if not exist "!CPDIR!" goto cp_fail
 copy /y "%PAYLOAD%\%~1" "!CPD!" >nul
 if errorlevel 1 goto cp_fail
+fc /b "%PAYLOAD%\%~1" "!CPD!" >nul
+if errorlevel 1 goto cp_fail
 echo   copied %~1
 goto :eof
 
 :cp_fail
-echo ERROR: could not copy %~1
+echo ERROR: could not copy or verify %~1. Antivirus software or Windows Controlled folder access may be blocking writes to the Applio folder.
 set "CP_ERR=1"
 goto :eof

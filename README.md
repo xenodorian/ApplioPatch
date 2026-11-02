@@ -33,6 +33,16 @@ The first time you use each restorer, Applio builds a separate environment under
 
 The environments are isolated so their dependencies cannot conflict with Applio's.
 
+## Built-in safeguards
+
+- The installer refuses folders with an exclamation mark in the path and ZIPs run without extracting, verifies every copied file, and backs up the originals.
+- Before a restorer installs, it checks for 10 GB of free disk space and warns if GitHub, PyPI or the model hosts cannot be reached.
+- Failures are explained in plain words (disk full, path too long, access denied, blocked download, git missing, out of memory) at the top of the error shown in the GUI.
+- Resemble Enhance installs from a GitHub zip and falls back to git, so git is not required.
+- If the GPU runs out of memory, restoration retries on the CPU. If the restorer environment has no CUDA support, it runs on the CPU instead of crashing.
+- Deeply nested Applio folders on Windows use a short folder at the drive root for the environment, to stay under the 260 character path limit.
+- The GUI warns before a first-use install starts, since it can take a long time.
+
 ## What was verified
 
 Run in the authoring sandbox (Linux, CPU):
@@ -53,6 +63,8 @@ Run in the authoring sandbox (Linux, CPU):
 
 - Restorer weights are trusted downloads from the official Resemble AI Hugging Face repo and the VoiceFixer Zenodo record, and are not hash-pinned.
 - Each file launches the restorer and reloads the model.
+- Applio updates overwrite the patched files. Run `install.bat` again afterward.
+- Very long vocals may still need a lot of memory. This is untested.
 - Restoration changes the input signal. Compare against the original before converting at scale.
 - Preset files do not save restoration settings yet. The command line options from the earlier patch are not included in the 3.6.4 version.
 

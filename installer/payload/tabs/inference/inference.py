@@ -518,6 +518,23 @@ def split_restore_args(args):
     return args[:-count], options
 
 
+def first_run_notice(mode):
+    """Tell the user up front when a restorer still has to be installed."""
+    if mode in (None, "off"):
+        return
+    try:
+        from rvc.lib.tools.audio_restore import sidecar_ready
+
+        if not sidecar_ready(mode):
+            gr.Info(
+                i18n(
+                    "First use of this restorer: installing it now. This can take a long time and needs internet. Progress is shown in the console window. Keep this page open."
+                )
+            )
+    except Exception:
+        pass
+
+
 def restoration_controls(with_preview=False):
     """Vocal restoration panel. Returns the components in RESTORE_KEYS order."""
     with gr.Accordion(i18n("Vocal restoration"), open=False):
@@ -616,7 +633,7 @@ def preview_restoration(audio_path, mode, blend, nfe, solver, lambd, tau):
         gr.Info(i18n("Choose a restoration method first."))
         return i18n("Restoration is off."), None
     try:
-        gr.Info(i18n("Restoring audio. The first run can take a long time."))
+        first_run_notice(mode)
         from rvc.lib.tools.audio_restore import restore_file
 
         out = restore_file(
@@ -1310,6 +1327,7 @@ def inference_tab():
                 return message, None
             try:
                 base_args, restore_options = split_restore_args(args)
+                first_run_notice(restore_options["restore_mode"])
                 return run_infer_script(*base_args, **restore_options)
             except Exception as error:
                 traceback.print_exc()
@@ -1326,6 +1344,7 @@ def inference_tab():
                 return message
             try:
                 base_args, restore_options = split_restore_args(args)
+                first_run_notice(restore_options["restore_mode"])
                 return run_batch_infer_script(*base_args, **restore_options)
             except Exception as error:
                 traceback.print_exc()
