@@ -5017,10 +5017,10 @@ index debee19..cad8d83 100644
 +    )
 diff --git a/rvc/lib/tools/audio_restore.py b/rvc/lib/tools/audio_restore.py
 new file mode 100644
-index 0000000..ccf0c4a
+index 0000000..9a845be
 --- /dev/null
 +++ b/rvc/lib/tools/audio_restore.py
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,417 @@
 +"""Optional vocal restoration before conversion (VoiceFixer, Resemble Enhance).
 +
 +Both restorers depend on packages that conflict with Applio's pinned stack
@@ -5048,7 +5048,7 @@ index 0000000..ccf0c4a
 +import soundfile as sf
 +import soxr
 +
-+SIDECAR_VERSION = "1"
++SIDECAR_VERSION = "2"
 +WORKER = Path(__file__).with_name("audio_restore_worker.py")
 +APPLIO_ROOT = Path(__file__).resolve().parents[3]
 +TIMEOUT_SECONDS = 60 * 60
@@ -5196,20 +5196,27 @@ index 0000000..ccf0c4a
 +        label=label,
 +    )
 +    base = [uv, "pip", "install", "--python", str(python)]
-+    # "auto" picks CUDA wheels when an NVIDIA driver is present and CPU
-+    # wheels otherwise, so restoration runs on the GPU where one exists. If
-+    # that lookup fails (for example the PyTorch index is unreachable), fall
-+    # back to the default wheels.
++    # Try the CUDA wheels that match Applio's own PyTorch first, then uv's
++    # automatic choice, then the default wheels (CPU only on Windows). The
++    # first one that installs wins.
 +    install = ["--exclude-newer", RESOLVE_DATE, *spec["packages"]]
-+    try:
-+        _run(
-+            base + ["--torch-backend", "auto", *install],
-+            timeout=INSTALL_TIMEOUT_SECONDS,
-+            label=label,
-+        )
-+    except RuntimeError as error:
-+        print(f"GPU wheel lookup failed, using default wheels:\n{error}", flush=True)
-+        _run(base + install, timeout=INSTALL_TIMEOUT_SECONDS, label=label)
++    attempts = []
++    applio_backend = _applio_torch_backend()
++    if applio_backend:
++        attempts.append(["--torch-backend", applio_backend])
++    attempts += [["--torch-backend", "auto"], []]
++    for index, extra in enumerate(attempts):
++        try:
++            _run(
++                base + extra + install,
++                timeout=INSTALL_TIMEOUT_SECONDS,
++                label=label,
++            )
++            break
++        except RuntimeError as error:
++            if index == len(attempts) - 1:
++                raise
++            print(f"Install attempt failed, trying the next option:\n{error}", flush=True)
 +    if spec["nodeps"]:
 +        _run(
 +            base + ["--no-deps", *spec["nodeps"]],
@@ -5217,7 +5224,47 @@ index 0000000..ccf0c4a
 +            label=label,
 +        )
 +    marker.write_text(wanted)
++    _remove_old_sidecars(backend, env)
++    _report_gpu(python)
 +    return python
++
++
++def _applio_torch_backend():
++    """The uv torch backend matching Applio's own CUDA build, or None."""
++    try:
++        import torch
++
++        version = torch.version.cuda
++        return "cu" + version.replace(".", "") if version else None
++    except Exception:
++        return None
++
++
++def _remove_old_sidecars(backend, current):
++    """Delete environments from older sidecar versions to free disk space."""
++    for old in _root().glob(f"{backend}-v*"):
++        if old != current and old.is_dir():
++            shutil.rmtree(old, ignore_errors=True)
++
++
++def _report_gpu(python):
++    """Say whether the new environment can use the GPU."""
++    try:
++        result = subprocess.run(
++            [str(python), "-I", "-c", "import torch;print(torch.cuda.is_available())"],
++            capture_output=True,
++            text=True,
++            timeout=300,
++        )
++        usable = result.stdout.strip() == "True"
++    except Exception:
++        usable = False
++    print(
++        "Restoration environment can use the GPU."
++        if usable
++        else "Restoration environment is CPU only, so restoration will be slow.",
++        flush=True,
++    )
 +
 +
 +def _device():
@@ -5393,10 +5440,10 @@ index 0000000..ccf0c4a
 +    return str(out)
 diff --git a/rvc/lib/tools/audio_restore_worker.py b/rvc/lib/tools/audio_restore_worker.py
 new file mode 100644
-index 0000000..bf96108
+index 0000000..60e95d0
 --- /dev/null
 +++ b/rvc/lib/tools/audio_restore_worker.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,186 @@
 +"""Sidecar entry point for audio restoration.
 +
 +Runs inside the isolated restoration environment, never inside Applio's own
@@ -5569,6 +5616,14 @@ index 0000000..bf96108
 +    parser.add_argument("--lambd", type=float, default=0.5)
 +    parser.add_argument("--tau", type=float, default=0.5)
 +    args = parser.parse_args(argv)
++    if args.device == "cuda":
++        # The caller picks the device from Applio's own PyTorch, but this
++        # environment has its own, which may be a CPU-only build.
++        import torch
++
++        if not torch.cuda.is_available():
++            print("CUDA is not available in this environment, using the CPU.")
++            args.device = "cpu"
 +    BACKENDS[args.backend](args)
 +    return 0
 +

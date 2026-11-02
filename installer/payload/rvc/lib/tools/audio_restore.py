@@ -25,7 +25,7 @@ import numpy as np
 import soundfile as sf
 import soxr
 
-SIDECAR_VERSION = "1"
+SIDECAR_VERSION = "2"
 WORKER = Path(__file__).with_name("audio_restore_worker.py")
 APPLIO_ROOT = Path(__file__).resolve().parents[3]
 TIMEOUT_SECONDS = 60 * 60
@@ -173,20 +173,27 @@ def ensure_sidecar(backend):
         label=label,
     )
     base = [uv, "pip", "install", "--python", str(python)]
-    # "auto" picks CUDA wheels when an NVIDIA driver is present and CPU
-    # wheels otherwise, so restoration runs on the GPU where one exists. If
-    # that lookup fails (for example the PyTorch index is unreachable), fall
-    # back to the default wheels.
+    # Try the CUDA wheels that match Applio's own PyTorch first, then uv's
+    # automatic choice, then the default wheels (CPU only on Windows). The
+    # first one that installs wins.
     install = ["--exclude-newer", RESOLVE_DATE, *spec["packages"]]
-    try:
-        _run(
-            base + ["--torch-backend", "auto", *install],
-            timeout=INSTALL_TIMEOUT_SECONDS,
-            label=label,
-        )
-    except RuntimeError as error:
-        print(f"GPU wheel lookup failed, using default wheels:\n{error}", flush=True)
-        _run(base + install, timeout=INSTALL_TIMEOUT_SECONDS, label=label)
+    attempts = []
+    applio_backend = _applio_torch_backend()
+    if applio_backend:
+        attempts.append(["--torch-backend", applio_backend])
+    attempts += [["--torch-backend", "auto"], []]
+    for index, extra in enumerate(attempts):
+        try:
+            _run(
+                base + extra + install,
+                timeout=INSTALL_TIMEOUT_SECONDS,
+                label=label,
+            )
+            break
+        except RuntimeError as error:
+            if index == len(attempts) - 1:
+                raise
+            print(f"Install attempt failed, trying the next option:\n{error}", flush=True)
     if spec["nodeps"]:
         _run(
             base + ["--no-deps", *spec["nodeps"]],
@@ -194,7 +201,47 @@ def ensure_sidecar(backend):
             label=label,
         )
     marker.write_text(wanted)
+    _remove_old_sidecars(backend, env)
+    _report_gpu(python)
     return python
+
+
+def _applio_torch_backend():
+    """The uv torch backend matching Applio's own CUDA build, or None."""
+    try:
+        import torch
+
+        version = torch.version.cuda
+        return "cu" + version.replace(".", "") if version else None
+    except Exception:
+        return None
+
+
+def _remove_old_sidecars(backend, current):
+    """Delete environments from older sidecar versions to free disk space."""
+    for old in _root().glob(f"{backend}-v*"):
+        if old != current and old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def _report_gpu(python):
+    """Say whether the new environment can use the GPU."""
+    try:
+        result = subprocess.run(
+            [str(python), "-I", "-c", "import torch;print(torch.cuda.is_available())"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        usable = result.stdout.strip() == "True"
+    except Exception:
+        usable = False
+    print(
+        "Restoration environment can use the GPU."
+        if usable
+        else "Restoration environment is CPU only, so restoration will be slow.",
+        flush=True,
+    )
 
 
 def _device():

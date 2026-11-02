@@ -170,6 +170,14 @@ def main(argv=None):
     parser.add_argument("--lambd", type=float, default=0.5)
     parser.add_argument("--tau", type=float, default=0.5)
     args = parser.parse_args(argv)
+    if args.device == "cuda":
+        # The caller picks the device from Applio's own PyTorch, but this
+        # environment has its own, which may be a CPU-only build.
+        import torch
+
+        if not torch.cuda.is_available():
+            print("CUDA is not available in this environment, using the CPU.")
+            args.device = "cpu"
     BACKENDS[args.backend](args)
     return 0
 

@@ -29,7 +29,7 @@ Suggested workflow: pick the input, choose a method, click Preview, listen, adju
 
 ## First use
 
-The first time you use each restorer, Applio builds a separate environment under `assets\audio-restore` and downloads model weights. This needs internet, several GB of disk per restorer (about 6 GB measured on Linux), and can take a long time. Progress prints in the console window that run-applio.bat opened. Later runs reuse it, and identical repeat runs are served from a cache of the last 24 results. Delete `assets\audio-restore` to remove everything.
+The first time you use each restorer, Applio builds a separate environment under `assets\audio-restore` and downloads model weights. This needs internet, several GB of disk per restorer (about 6 GB measured on Linux, and the CUDA version of Applio's own PyTorch is matched so the GPU is used), and can take a long time. Progress prints in the console window that run-applio.bat opened. Later runs reuse it, and identical repeat runs are served from a cache of the last 24 results. Delete `assets\audio-restore` to remove everything.
 
 The environments are isolated so their dependencies cannot conflict with Applio's.
 
