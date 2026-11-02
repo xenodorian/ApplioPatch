@@ -111,8 +111,7 @@ goto :eof
 rem %1 = relative path
 if defined RS_ERR goto :eof
 if not exist "!BK!\%~1" goto rs_nobackup
-copy /y "!BK!\%~1" "!APPLIO!\%~1" >nul
-if errorlevel 1 goto rs_fail
+copy /y "!BK!\%~1" "!APPLIO!\%~1" >nul || goto rs_fail
 echo   restored %~1
 goto :eof
 

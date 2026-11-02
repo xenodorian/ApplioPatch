@@ -85,7 +85,7 @@ if defined BK_ERR goto fail_backup
 
 > "!BK!\NEW_FILES.txt" echo rvc\lib\tools\audio_restore.py
 >> "!BK!\NEW_FILES.txt" echo rvc\lib\tools\audio_restore_worker.py
-if errorlevel 1 goto fail_backup
+if not exist "!BK!\NEW_FILES.txt" goto fail_backup
 
 rem ---- Step 7: copy payload into the Applio tree ----
 echo.
@@ -241,6 +241,7 @@ goto :eof
 :confirm_one
 rem %1 = index, %2 = relative path
 if not "!ST%~1!"=="MOD" goto :eof
+if exist "!BK!\%~2" goto :eof
 set "CF_REL=%~2"
 echo.
 echo WARNING: !CF_REL! differs from both the original and the patched version.
@@ -262,8 +263,7 @@ set "BD="
 for %%D in ("!BF!") do set "BD=%%~dpD"
 if not exist "!BD!" mkdir "!BD!"
 if not exist "!BD!" goto bk_fail
-copy /y "!BS!" "!BF!" >nul
-if errorlevel 1 goto bk_fail
+copy /y "!BS!" "!BF!" >nul || goto bk_fail
 echo   backed up %~2
 goto :eof
 
@@ -290,10 +290,8 @@ set "CPDIR="
 for %%D in ("!CPD!") do set "CPDIR=%%~dpD"
 if not exist "!CPDIR!" mkdir "!CPDIR!"
 if not exist "!CPDIR!" goto cp_fail
-copy /y "%PAYLOAD%\%~1" "!CPD!" >nul
-if errorlevel 1 goto cp_fail
-fc /b "%PAYLOAD%\%~1" "!CPD!" >nul
-if errorlevel 1 goto cp_fail
+copy /y "%PAYLOAD%\%~1" "!CPD!" >nul || goto cp_fail
+fc /b "%PAYLOAD%\%~1" "!CPD!" >nul || goto cp_fail
 echo   copied %~1
 goto :eof
 
